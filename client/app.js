@@ -19,7 +19,6 @@
 const WS_URL = "ws://127.0.0.1:8765";
 const statusEl = document.getElementById("status");
 const liveEl = document.getElementById("live");
-const recallEl = document.getElementById("recall");
 
 let ws;
 
@@ -77,12 +76,180 @@ function connect() {
     statusEl.textContent = "connection error";
   });
 }
-
 for (const button of document.querySelectorAll("button[data-seconds]")) {
   button.addEventListener("click", () => {
     const seconds = Number(button.dataset.seconds);
-    recallEl.textContent = `TODO: show finalized captions from the previous ${seconds} seconds using local state.`;
+    // TODO
   });
 }
 
 connect();
+
+class FrontEndRenderer {
+    element;
+    segments = {};
+
+    constructor(element) {
+        this.element = element;
+    }
+
+    create_row(segment_id) {
+        let row = document.createElement("div");
+        row.className = "caption-segment-line";
+        row.segment_id = segment_id;
+        row.history = []; // Initialize history tracking
+
+        const header = document.createElement("div");
+        header.className = "caption-segment-header";
+        row.appendChild(header);
+
+        const history_div = document.createElement("div");
+        history_div.className = "caption-segment-history";
+        row.appendChild(history_div);
+
+        header.addEventListener("click", () => {
+            row.classList.toggle("expanded");
+        });
+
+        this.element.appendChild(row);
+        this.segments[segment_id] = row;
+        return row;
+    }
+
+    refresh(sorted) {
+        if (sorted) {
+            const elements = Array.from(this.element.children);
+            elements.sort((a, b) => {
+                return a.segment_id - b.segment_id;
+            });
+            elements.forEach(el => this.element.appendChild(el));
+        }
+        this.element.scrollTop = this.element.scrollHeight;
+    }
+
+    remove(segment_id) {
+        // TODO
+    }
+
+    append(msg) {
+        let segment_id = msg.segment;
+        if (segment_id == null) return;
+
+        let row = this.segments[segment_id];
+        let has_new_segment = false;
+
+        if (row == null) {
+            row = this.create_row(segment_id);
+            has_new_segment = true;
+            row.is_final = false
+        }
+
+        // Push new revision to history
+        row.is_final = row.is_final || msg.final
+        row.history.push({
+            state: msg.final,
+            revision: msg.revision,
+            text: msg.text
+        });
+
+        // Sort history by revision number
+        row.history.sort((a, b) => a.revision - b.revision);
+        const latestRevision = row.history[row.history.length - 1];
+
+        // Update header component
+        const header = row.querySelector(".caption-segment-header");
+        header.innerHTML =  `<div>
+            <span class="history-meta">${msg.segment}</span>
+            <span>${latestRevision.text}</span>
+        </div>`;
+
+        if (row.is_final) {
+            row.classList.add("is-final");
+        } else {
+            row.classList.remove("is-final");
+        }
+
+        // Update history
+        const history_div = row.querySelector(".caption-segment-history");
+        history_div.innerHTML = `
+    <div>
+    <ul class="history-list">
+        ${row.history.map(h => `
+            <li class="history-item ${h.state ? 'is-final' : 'is-provisional'}">
+                <span class="history-meta">${h.revision}</span>
+                <span class="history-text">${h.text}</span>
+            </li>
+        `).join('')}
+    </ul>
+    </div>
+`;
+        this.refresh(has_new_segment);
+    }
+}
+
+const live_caption_renderer = new FrontEndRenderer(liveEl);
+
+function appendImpl(msg) {
+    live_caption_renderer.append(msg);
+}
+
+// For frontend testing (to be deleted)
+async function runMassiveOutOfOrderTest() {
+    const totalSegments = 25; // Creates ~100 messages total (approx. 4 revisions per segment)
+    let rawStream = [];
+
+    // Pool of base sentences to generate realistic text
+    const samplePhrases = [
+        "Transmission Control Protocol ensures reliable and ordered byte stream delivery.",
+        "In computer networking, routing is the process of selecting optimal paths across nodes.",
+        "Establishing a connection requires a meticulous three-way handshake procedure.",
+        "Flow control mechanisms prevent fast senders from overwhelming slow receivers.",
+        "Congestion avoidance algorithms actively monitor and adjust network load.",
+        "Packet switching breaks application data into manageable, independently routed chunks.",
+        "IP addresses uniquely identify source and destination hosts across the internet.",
+        "Domain Name System servers translate human-readable hostnames into numeric IP addresses."
+    ];
+
+    // 1. Generate structured revisions for each segment
+    for (let seg = 1; seg <= totalSegments; seg++) {
+        const basePhrase = samplePhrases[(seg - 1) % samplePhrases.length];
+        const numRevisions = Math.floor(Math.random() * 3) + 2; // 2 to 4 revisions per segment
+
+        for (let rev = 1; rev <= numRevisions; rev++) {
+            let text = basePhrase;
+            
+            // Make earlier provisional revisions shorter to simulate real-time text expansion
+            if (rev < numRevisions) {
+                const words = basePhrase.split(" ");
+                const wordCount = Math.max(3, Math.floor((rev / numRevisions) * words.length));
+                text = words.slice(0, wordCount).join(" ") + "...";
+            }
+
+            rawStream.push({
+                segment: seg,
+                revision: rev,
+                text: text,
+                final: (rev === numRevisions) // Only the highest revision is marked final
+            });
+        }
+    }
+
+    // 2. Shuffle the array randomly (Fisher-Yates shuffle) to guarantee out-of-order delivery
+    for (let i = rawStream.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [rawStream[i], rawStream[j]] = [rawStream[j], rawStream[i]];
+    }
+
+    console.log(`Starting massive test with ${rawStream.length} scrambled messages...`);
+
+    // 3. Stream them with a fast 80ms delay so you can watch your UI handle the chaos smoothly
+    for (const msg of rawStream) {
+        await new Promise(resolve => setTimeout(resolve, 140 + 100 * Math.random()));
+        appendImpl(msg);
+    }
+
+    console.log("Massive out-of-order test finished!");
+}
+
+// To run the test in your console, just call:
+runMassiveOutOfOrderTest();

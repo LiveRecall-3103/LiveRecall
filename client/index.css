@@ -1,0 +1,156 @@
+/* Container styling with border restored */
+#live {
+    height: 60vh;          /* Sets the height to 75% (6/8) of the screen height */
+    border: 1px solid #bbb;
+    border-radius: .4rem;
+    padding: 1rem;
+    margin: 1rem 0;
+    overflow-y: auto;      /* Enables vertical scrolling when content exceeds 75vh */
+}
+
+/* Zero space between lines by default */
+.caption-segment-line {
+    border-bottom: 0.5px solid #f3f5f8;
+    margin: 0.1 0.1;
+    padding: 0 0.4px;
+    transition: margin 0.3s ease-in-out;
+}
+
+/* Add breathing room only when expanded */
+.caption-segment-line.expanded {
+    margin-bottom: 8px;
+}
+
+.caption-segment-header {
+    cursor: pointer;
+    padding: 2px 4px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-radius: 4px;
+    transition: background-color 0.2s ease;
+}
+
+/* Hover effect: Slightly red box only (no underline) */
+.caption-segment-header:hover {
+    background-color: rgba(139, 0, 0, 0.06); 
+}
+
+/* Color differentiation for Final vs Provisional (Red Theme) */
+.caption-segment-line.is-final .caption-segment-header {
+    color: darkred;
+}
+
+.caption-segment-line:not(.is-final) .caption-segment-header {
+    color: gray;
+}
+
+/* --- Smooth Accordion Animation using CSS Grid --- */
+.caption-segment-history {
+    display: grid;
+    grid-template-rows: 0fr; /* Collapsed state */
+    opacity: 0;
+    transition: grid-template-rows 0.3s ease-in-out, opacity 0.2s ease-in-out;
+}
+
+/* Inner wrapper handles overflow and padding so it collapses cleanly to 0 */
+.caption-segment-history > div {
+    min-height: 0;
+    overflow: hidden;
+    padding: 0 10px;
+    transition: padding 0.3s ease-in-out;
+}
+
+/* Expanded state */
+.caption-segment-line.expanded .caption-segment-history {
+    grid-template-rows: 1fr;
+    opacity: 1;
+}
+
+.caption-segment-line.expanded .caption-segment-history > div {
+    padding: 4px 10px;
+}
+
+/* History List Styles */
+.history-list {
+    list-style: none;
+    padding: 0;
+    margin: 2px 0 0 0;
+}
+
+.history-item {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 3px;
+}
+
+.history-meta {
+    white-space: nowrap;
+    font-size: 0.7em;
+}
+
+.history-text {
+    word-break: break-word;
+}
+
+/* Provisional History: Gray */
+.history-item.is-provisional {
+    color: gray;
+}
+
+.history-item.is-provisional .history-meta {
+    color: darkgray;
+}
+
+/* Final History: Dark Red */
+.history-item.is-final {
+    color: darkred;
+}
+
+.history-item.is-final .history-meta {
+    color: #b30000;
+}
+
+/* Base Button Styling */
+.btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.5rem 1rem;
+    font-family: inherit;
+    font-size: 0.95rem;
+    font-weight: 500;
+    color: #333;
+    background-color: #ffffff;
+    border: 1px solid #ccc;
+    border-radius: .4rem; /* Matches your #live container */
+    cursor: pointer;
+    transition: all 0.2s ease-in-out;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+}
+
+/* Hover Effect (Matches your red theme accent) */
+.btn:hover {
+    background-color: rgba(139, 0, 0, 0.04); /* Subtle red tint */
+    border-color: darkred;
+    color: darkred;
+}
+
+/* Active / Click State */
+.btn:active {
+    transform: translateY(1px);
+    background-color: rgba(139, 0, 0, 0.08);
+}
+
+/* Optional: Primary / Highlight Variant (e.g. for "What did I miss?") */
+.btn-primary {
+    background-color: darkred;
+    color: white;
+    border-color: darkred;
+}
+
+.btn-primary:hover {
+    background-color: #a30000;
+    color: white;
+    border-color: #a30000;
+}
