@@ -154,3 +154,15 @@
     color: white;
     border-color: #a30000;
 }
+
+/* Indicate when the button is pressed */
+.btn[timing-pressed="true"] {
+    background-color: darkred;
+    color: white;
+    border-color: darkred;
+}
+
+.btn[timing-pressed="true"]:hover {
+    background-color: #a30000;
+    color: white;
+}

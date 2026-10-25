@@ -19,8 +19,20 @@
 const WS_URL = "ws://127.0.0.1:8765";
 const statusEl = document.getElementById("status");
 const liveEl = document.getElementById("live");
+const recallButtons = document.querySelectorAll("button[data-seconds]");
 
 let ws;
+let recallSeconds = 30;
+
+// To set the recallSeconds after button press
+function setRecallSeconds(seconds) {
+    recallSeconds = seconds;
+    for (const button of recallButtons) {
+        const selected = Number(button.dataset.seconds) === seconds;
+        button.setAttribute("timing-pressed", String(selected))
+    }
+    // TODO update the Frontend Renderer based on the options selected
+}
 
 function numericClientId() {
   const key = "liverecall-client-id";
@@ -76,12 +88,13 @@ function connect() {
     statusEl.textContent = "connection error";
   });
 }
-for (const button of document.querySelectorAll("button[data-seconds]")) {
+
+for (const button of recallButtons) {
   button.addEventListener("click", () => {
-    const seconds = Number(button.dataset.seconds);
-    // TODO
+    setRecallSeconds(Number(button.dataset.seconds));
   });
 }
+setRecallSeconds(30); 
 
 connect();
 
