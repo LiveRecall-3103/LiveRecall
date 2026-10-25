@@ -8,7 +8,7 @@
  *   - displays whether an update is provisional/final
  *
  * Graded TODOs:
- *   - replace revisions rather than appending duplicates
+ *   - replace revisions rather than appending duplicates   [Done]
  *   - maintain >=60 s of finalized local state
  *   - implement 30 s default recall + 15/30/60 s views     [Done]
  *   - automatic reconnect + correct resume state
@@ -24,29 +24,24 @@ class FrontEndRenderer {
         this.element = element;
     }
 
+    // Create a new row
     create_row(segment_id) {
         let row = document.createElement("div");
         row.className = "caption-segment-line";
+        row.revision_id = -1     // Sets to -1 so that when it is compared to itself later, it will pass
         row.segment_id = segment_id;
-        row.history = []; // Initialize history tracking
 
+        // To display each row message
         const header = document.createElement("div");
         header.className = "caption-segment-header";
         row.appendChild(header);
-
-        const history_div = document.createElement("div");
-        history_div.className = "caption-segment-history";
-        row.appendChild(history_div);
-
-        header.addEventListener("click", () => {
-            row.classList.toggle("expanded");
-        });
 
         this.element.appendChild(row);
         this.segments[segment_id] = row;
         return row;
     }
 
+    // Hides rows that are not inside the 15/30/60s window
     applyWindow() {
         for (const row of Object.values(this.segments)) {
             row.hidden = checkTimeInRange(row.source_ts, recallSeconds)
@@ -72,6 +67,9 @@ class FrontEndRenderer {
         let segment_id = msg.segment;
         if (segment_id == null) return;
 
+        let revision_id = msg.revision
+        if (revision_id == null) return;
+
         let row = this.segments[segment_id];
         let has_new_segment = false;
 
@@ -81,25 +79,20 @@ class FrontEndRenderer {
             row.is_final = false;
             row.source_ts = msg.source_ts;
         }
-
-        // Push new revision to history
-        row.is_final = row.is_final || msg.final
-        row.history.push({
-            state: msg.final,
-            revision: msg.revision,
-            text: msg.text
-        });
-
-        // Sort history by revision number
-        row.history.sort((a, b) => a.revision - b.revision);
-        const latestRevision = row.history[row.history.length - 1];
-
+    
         // Update header component
-        const header = row.querySelector(".caption-segment-header");
-        header.innerHTML =  `<div>
-            <span class="history-meta">${msg.segment}</span>
-            <span>${latestRevision.text}</span>
-        </div>`;
+        if (revision_id > row.revision_id) {
+            row.revision_id = revision_id;
+            const header = row.querySelector(".caption-segment-header");
+            header.innerHTML =  `<div>
+                <span class="history-meta">${msg.segment}</span>
+                <span>${msg.text}</span>
+            </div>`;
+        } else {
+            return;
+        }
+        
+        row.is_final = row.is_final || msg.final
 
         if (row.is_final) {
             row.classList.add("is-final");
@@ -107,20 +100,6 @@ class FrontEndRenderer {
             row.classList.remove("is-final");
         }
 
-        // Update history
-        const history_div = row.querySelector(".caption-segment-history");
-        history_div.innerHTML = `
-    <div>
-    <ul class="history-list">
-        ${row.history.map(h => `
-            <li class="history-item ${h.state ? 'is-final' : 'is-provisional'}">
-                <span class="history-meta">${h.revision}</span>
-                <span class="history-text">${h.text}</span>
-            </li>
-        `).join('')}
-    </ul>
-    </div>
-`;
         this.refresh(has_new_segment);
     }
 }
