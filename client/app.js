@@ -9,7 +9,7 @@
  *
  * Graded TODOs:
  *   - replace revisions rather than appending duplicates   [Done]
- *   - maintain >=60 s of finalized local state
+ *   - maintain >=60 s of finalized local state             [Done]
  *   - implement 30 s default recall + 15/30/60 s views     [Done]
  *   - automatic reconnect + correct resume state
  *   - HISTORY merge/deduplication
@@ -48,6 +48,15 @@ class FrontEndRenderer {
         }
     }
 
+    // Remove rows from this.segments if it exceeds the KEEP_MESSAGE_WINDOW
+    prune() {
+        for (const [segment_id, row] of Object.entries(this.segments)) {
+            if (checkTimeInRange(row.source_ts, KEEP_MESSAGE_WINDOW)) {
+                this.remove(segment_id);
+            }
+        }
+    }
+
     refresh(sorted) {
         if (sorted) {
             const elements = Array.from(this.element.children);
@@ -60,7 +69,12 @@ class FrontEndRenderer {
     }
 
     remove(segment_id) {
-        // TODO
+        const row = this.segments[segment_id];
+        if (row == null) {
+            return;
+        }
+        row.remove();
+        delete this.segments[segment_id];
     }
 
     append(msg) {
@@ -83,6 +97,7 @@ class FrontEndRenderer {
         // Update header component
         if (revision_id > row.revision_id) {
             row.revision_id = revision_id;
+            row.source_ts = msg.source_ts;
             const header = row.querySelector(".caption-segment-header");
             header.innerHTML =  `<div>
                 <span class="history-meta">${msg.segment}</span>
@@ -108,6 +123,7 @@ const WS_URL = "ws://127.0.0.1:8765";
 const statusEl = document.getElementById("status");
 const liveEl = document.getElementById("live");
 const recallButtons = document.querySelectorAll("button[data-seconds]");
+const KEEP_MESSAGE_WINDOW = 90;
 const live_caption_renderer = new FrontEndRenderer(liveEl);
 
 let ws;
@@ -257,7 +273,10 @@ async function runMassiveOutOfOrderTest() {
 }
 
 // To update the window every second
-setInterval(() => live_caption_renderer.applyWindow(), 1000);
+setInterval(() => {
+        live_caption_renderer.applyWindow();
+        live_caption_renderer.prune();
+    }, 1000);
 
 // To run the test in your console, just call:
 runMassiveOutOfOrderTest();
