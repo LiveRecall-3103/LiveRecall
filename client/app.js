@@ -10,93 +10,11 @@
  * Graded TODOs:
  *   - replace revisions rather than appending duplicates
  *   - maintain >=60 s of finalized local state
- *   - implement 30 s default recall + 15/30/60 s views
+ *   - implement 30 s default recall + 15/30/60 s views     [Done]
  *   - automatic reconnect + correct resume state
  *   - HISTORY merge/deduplication
  *   - usable final UI
  */
-
-const WS_URL = "ws://127.0.0.1:8765";
-const statusEl = document.getElementById("status");
-const liveEl = document.getElementById("live");
-const recallButtons = document.querySelectorAll("button[data-seconds]");
-
-let ws;
-let recallSeconds = 30;
-
-// To set the recallSeconds after button press
-function setRecallSeconds(seconds) {
-    recallSeconds = seconds;
-    for (const button of recallButtons) {
-        const selected = Number(button.dataset.seconds) === seconds;
-        button.setAttribute("timing-pressed", String(selected))
-    }
-    // TODO update the Frontend Renderer based on the options selected
-}
-
-function numericClientId() {
-  const key = "liverecall-client-id";
-  let value = sessionStorage.getItem(key);
-  if (!value) {
-    value = String(Math.floor(100000 + Math.random() * 900000));
-    sessionStorage.setItem(key, value);
-  }
-  return Number(value);
-}
-
-function appendNaively(msg) {
-  const row = document.createElement("div");
-  row.className = "naive-line";
-  const state = msg.final ? "FINAL" : "PROVISIONAL";
-  row.textContent = `[${state}] segment ${msg.segment} rev ${msg.revision}: ${msg.text}`;
-  liveEl.appendChild(row);
-  liveEl.scrollTop = liveEl.scrollHeight;
-}
-
-function connect() {
-  statusEl.textContent = "connecting";
-  ws = new WebSocket(WS_URL);
-
-  ws.addEventListener("open", () => {
-    statusEl.textContent = "connected";
-    ws.send(JSON.stringify({
-      type: "CLIENT_HELLO",
-      client_id: numericClientId(),
-      session: "L1",
-      last_segment: 0,       // TODO: resume latest finalized state
-      last_revision: 0,
-      history_seconds: 30
-    }));
-  });
-
-  ws.addEventListener("message", (event) => {
-    const msg = JSON.parse(event.data);
-    if (msg.type === "CAPTION_UPDATE") {
-      appendNaively(msg);
-    } else if (msg.type === "HISTORY") {
-      console.log(`HISTORY with ${msg.items?.length ?? 0} item(s)`, msg);
-      // TODO: merge history without stale/duplicate final captions.
-    }
-  });
-
-  ws.addEventListener("close", () => {
-    statusEl.textContent = "disconnected";
-    // TODO: automatic reconnect after a short delay, using finalized resume state.
-  });
-
-  ws.addEventListener("error", () => {
-    statusEl.textContent = "connection error";
-  });
-}
-
-for (const button of recallButtons) {
-  button.addEventListener("click", () => {
-    setRecallSeconds(Number(button.dataset.seconds));
-  });
-}
-setRecallSeconds(30); 
-
-connect();
 
 class FrontEndRenderer {
     element;
@@ -129,6 +47,12 @@ class FrontEndRenderer {
         return row;
     }
 
+    applyWindow() {
+        for (const row of Object.values(this.segments)) {
+            row.hidden = checkTimeInRange(row.source_ts, recallSeconds)
+        }
+    }
+
     refresh(sorted) {
         if (sorted) {
             const elements = Array.from(this.element.children);
@@ -154,7 +78,8 @@ class FrontEndRenderer {
         if (row == null) {
             row = this.create_row(segment_id);
             has_new_segment = true;
-            row.is_final = false
+            row.is_final = false;
+            row.source_ts = msg.source_ts;
         }
 
         // Push new revision to history
@@ -200,11 +125,98 @@ class FrontEndRenderer {
     }
 }
 
+const WS_URL = "ws://127.0.0.1:8765";
+const statusEl = document.getElementById("status");
+const liveEl = document.getElementById("live");
+const recallButtons = document.querySelectorAll("button[data-seconds]");
 const live_caption_renderer = new FrontEndRenderer(liveEl);
+
+let ws;
+let recallSeconds = 30;
+
+function checkTimeInRange(segment, window) {
+    const cutoff = Date.now() / 1000 - window;
+    return cutoff > segment;
+}
+
+// To set the recallSeconds after button press
+function setRecallSeconds(seconds) {
+    recallSeconds = seconds;
+    for (const button of recallButtons) {
+        const selected = Number(button.dataset.seconds) === seconds;
+        button.setAttribute("timing-pressed", String(selected))
+    }
+    live_caption_renderer.applyWindow();
+}
+
+function numericClientId() {
+  const key = "liverecall-client-id";
+  let value = sessionStorage.getItem(key);
+  if (!value) {
+    value = String(Math.floor(100000 + Math.random() * 900000));
+    sessionStorage.setItem(key, value);
+  }
+  return Number(value);
+}
+
+function appendNaively(msg) {
+  const row = document.createElement("div");
+  row.className = "naive-line";
+  const state = msg.final ? "FINAL" : "PROVISIONAL";
+  row.textContent = `[${state}] segment ${msg.segment} rev ${msg.revision}: ${msg.text}`;
+  liveEl.appendChild(row);
+  liveEl.scrollTop = liveEl.scrollHeight;
+}
 
 function appendImpl(msg) {
     live_caption_renderer.append(msg);
 }
+
+
+function connect() {
+  statusEl.textContent = "connecting";
+  ws = new WebSocket(WS_URL);
+
+  ws.addEventListener("open", () => {
+    statusEl.textContent = "connected";
+    ws.send(JSON.stringify({
+      type: "CLIENT_HELLO",
+      client_id: numericClientId(),
+      session: "L1",
+      last_segment: 0,       // TODO: resume latest finalized state
+      last_revision: 0,
+      history_seconds: 30
+    }));
+  });
+
+  ws.addEventListener("message", (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.type === "CAPTION_UPDATE") {
+      appendImpl(msg);
+    } else if (msg.type === "HISTORY") {
+      console.log(`HISTORY with ${msg.items?.length ?? 0} item(s)`, msg);
+      // TODO: merge history without stale/duplicate final captions.
+    }
+  });
+
+  ws.addEventListener("close", () => {
+    statusEl.textContent = "disconnected";
+    // TODO: automatic reconnect after a short delay, using finalized resume state.
+  });
+
+  ws.addEventListener("error", () => {
+    statusEl.textContent = "connection error";
+  });
+}
+
+for (const button of recallButtons) {
+  button.addEventListener("click", () => {
+    setRecallSeconds(Number(button.dataset.seconds));
+  });
+}
+setRecallSeconds(30); 
+
+connect();
 
 // For frontend testing (to be deleted)
 async function runMassiveOutOfOrderTest() {
@@ -258,11 +270,15 @@ async function runMassiveOutOfOrderTest() {
     // 3. Stream them with a fast 80ms delay so you can watch your UI handle the chaos smoothly
     for (const msg of rawStream) {
         await new Promise(resolve => setTimeout(resolve, 140 + 100 * Math.random()));
+        msg.source_ts = Date.now() / 1000;
         appendImpl(msg);
     }
 
     console.log("Massive out-of-order test finished!");
 }
+
+// To update the window every second
+setInterval(() => live_caption_renderer.applyWindow(), 1000);
 
 // To run the test in your console, just call:
 runMassiveOutOfOrderTest();
