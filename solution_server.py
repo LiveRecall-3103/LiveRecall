@@ -102,9 +102,12 @@ async def broadcast(raw_message: str) -> None:
         client.queue.put_nowait(raw_message)
 
 async def unicast(client) -> None:
-    while True:
-        msg = await client.queue.get()
-        await client.ws.send(msg)
+    try:
+        while True:
+            msg = await client.queue.get()
+            await client.ws.send(msg)
+    except websockets.ConnectionClosed:
+        pass
 
 async def handle_source(ws, hello: dict[str, Any]) -> None:
     session = hello.get("session")
