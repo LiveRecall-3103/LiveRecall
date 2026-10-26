@@ -98,8 +98,16 @@ async def broadcast(raw_message: str) -> None:
 
     snapshot = list(CLIENTS)
 
+    # Claude: suggested me to drop connection if client is too weak
+    # 
+    # Client to re-establish a connection to prevent client queue from
+    # getting too big
     for client in snapshot:
-        client.queue.put_nowait(raw_message)
+        try:
+            client.queue.put_nowait(raw_message)
+        except asyncio.QueueFull:
+            CLIENTS.discard(client)
+            asyncio.create_task(client.ws.close(code=1013, reason="client too slow"))
 
 async def unicast(client) -> None:
     try:
