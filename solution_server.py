@@ -29,10 +29,11 @@ import json
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
+from collections import Counter
 
 import websockets
 
-NAIVE = True
+NAIVE = False
 
 # Updated clients class
 class Client:
@@ -42,33 +43,10 @@ class Client:
         # Used to eliminate HOL blocking
         self.queue: asyncio.Queue[str] = asyncio.Queue(maxsize=maxsize)
 
-# Placeholder class Entry and CaptionStore to be replaced by Jimmy's real class
-@dataclass
-class Entry:
-    segment: int
-    revision: int
-    final: bool
-    source_ts: float
-    text: str
-    raw: str    
-
-class CaptionStore:
-    def init(self, keep_seconds: float = 90.0, max_items: int = 500):
-        self.keep_seconds = keep_seconds
-        self.max_items = max_items            # hard cap, in case timestamps misbehave
-        self.entries: dict[int, Entry] = {}   # segment -> newest Entry
-        self.order: deque[int] = deque()      # segment numbers, ascending
-        self.latest_ts = 0.0                  # newest source_ts seen
-        self.contig_final = 0                 # highest N where segments 1..N are al
-
-    def get_history(self, last_segment=0, last_revision=0, history_seconds=30) -> list[Entry]:
-        return
-# End of placeholder code
-
-# Naive global set of currently connected student clients.
-# There is deliberately no per-client queue or recovery state here.
 CLIENTS: set[Any] | set[Client] = set()
-db = CaptionStore()
+from server.store import CaptionStore, Entry, ACCEPTED
+# Global caption store, used by all source connections. 
+store = CaptionStore(keep_seconds=120.0, max_items=500)
 
 async def broadcast_naively(raw_message: str) -> None:
     """Send one message directly to every connected client.
@@ -77,6 +55,11 @@ async def broadcast_naively(raw_message: str) -> None:
     sends to complete. Under pressure, this design may accumulate delay and is
     not the target architecture for the assignment.
     """
+    
+    # Testing for Source - Server
+    print("broadcasting to %d clients: %s", len(CLIENTS), raw_message, flush=True)
+    
+    
     if not CLIENTS:
         return
 
@@ -117,29 +100,57 @@ async def unicast(client) -> None:
     except websockets.ConnectionClosed:
         pass
 
+# ---- message parsing for source updates ------------------------------------------------------
+def parse_update(msg: dict, raw: str) -> Entry | None:
+    try:
+        seg, rev = msg["segment"], msg["revision"]
+        fin, ts, text = msg["final"], msg["source_ts"], msg["text"]
+    except KeyError:
+        return None
+    if type(seg) is not int or type(rev) is not int or seg < 1 or rev < 1:
+        return None
+    if type(fin) is not bool or not isinstance(text, str):
+        return None
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return None
+    return Entry(seg, rev, fin, float(ts), text, raw)
+
 async def handle_source(ws, hello: dict[str, Any]) -> None:
     session = hello.get("session")
     print(f"source connected: session={session}", flush=True)
-
+    stats = Counter()
     try:
         async for raw in ws:
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
+                stats["bad_json"] += 1
+                continue
+            if not isinstance(msg, dict):
+                stats["not_object"] += 1
                 continue
 
             msg_type = msg.get("type")
             if msg_type == "CAPTION_UPDATE":
-                # Baseline behavior: forward exactly what was received.
-                # No history, state, validation, coalescing, or bounded queues.
-                if NAIVE:
-                    await broadcast_naively(raw)
-                else:
-                    await broadcast(raw)
+                entry = parse_update(msg, raw)
+                if entry is None:
+                    stats["invalid"] += 1
+                    continue
+                result = store.apply(entry)
+                stats[result] += 1
+                print(f"  seg {entry.segment:>3} rev {entry.revision} "
+                      f"{'FINAL' if entry.final else 'draft'} -> {result}", flush=True)
+                if result == ACCEPTED:
+                    if NAIVE:
+                        await broadcast_naively(raw)      # temporary, as before
+                    else:
+                        await broadcast(raw)
+
             elif msg_type == "SOURCE_DONE":
                 # Test-control message. The specification does not require it
                 # to be forwarded to clients.
                 print("source finished", flush=True)
+                dump_store(stats)
             else:
                 # Forward compatibility: ignore fields/messages this baseline
                 # doesn't understand rather than crashing.
@@ -147,10 +158,22 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
     finally:
         print("source disconnected", flush=True)
 
+
+def dump_store(stats):
+    print("---- store summary ----")
+    print("results     :", dict(stats))
+    print("entries     :", len(store.entries))
+    print("earliest    :", store.earliest, " latest:", store.latest)
+    print("contig_final:", store.contig_final)
+    print("active      :", [e.segment for e in store.active()])
+    for s in store.order:
+        e = store.entries[s]
+        print(f"  seg {s:>3} rev {e.revision} {'FINAL' if e.final else 'draft'} ts={e.source_ts:.3f} {e.text[:40]!r}")
+        
 """
 Handle client's connection to the server for the whole connection, including
 resuming connection state.
-"""
+"""        
 async def handle_client(ws, hello: dict[str, Any]) -> None:
     client_id = hello.get("client_id")
 
@@ -193,7 +216,7 @@ async def handle_client_new(ws, hello: dict[str, Any]) -> None:
     last_segment = int(hello.get("last_segment", 0))
     last_revision = int(hello.get("last_revision", 0))
     history_seconds = max(min(int(hello.get("history_seconds", 30)), 60), 0)
-    history = db.get_history(last_segment, last_revision, history_seconds)
+    history = store.get_history(last_segment, last_revision, history_seconds)
     history_msg = json.dumps({
                 "type": "HISTORY",
                 "items": [json.loads(entry.raw) for entry in (history or [])],
