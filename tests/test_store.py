@@ -1,4 +1,4 @@
-from store import CaptionStore, Entry, ACCEPTED, STALE, DUP_FINAL
+from LiveRecall.server.store import CaptionStore, Entry, ACCEPTED, STALE, DUP_FINAL
 
 def E(seg, rev, final, ts): return Entry(seg, rev, final, ts, f"s{seg}r{rev}", "{}")
 
