@@ -26,14 +26,49 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from collections import deque
+from dataclasses import dataclass
 from typing import Any
 
 import websockets
 
+NAIVE = True
+
+# Updated clients class
+class Client:
+    def __init__(self, ws, client_id, maxsize: int=100):
+        self.ws = ws
+        self.client_id = client_id
+        # Used to eliminate HOL blocking
+        self.queue: asyncio.Queue[str] = asyncio.Queue(maxsize=maxsize)
+
+# Placeholder class Entry and CaptionStore to be replaced by Jimmy's real class
+@dataclass
+class Entry:
+    segment: int
+    revision: int
+    final: bool
+    source_ts: float
+    text: str
+    raw: str    
+
+class CaptionStore:
+    def init(self, keep_seconds: float = 90.0, max_items: int = 500):
+        self.keep_seconds = keep_seconds
+        self.max_items = max_items            # hard cap, in case timestamps misbehave
+        self.entries: dict[int, Entry] = {}   # segment -> newest Entry
+        self.order: deque[int] = deque()      # segment numbers, ascending
+        self.latest_ts = 0.0                  # newest source_ts seen
+        self.contig_final = 0                 # highest N where segments 1..N are al
+
+    def get_history(self, last_segment=0, last_revision=0, history_seconds=30) -> list[Entry]:
+        return
+# End of placeholder code
+
 # Naive global set of currently connected student clients.
 # There is deliberately no per-client queue or recovery state here.
-CLIENTS: set[Any] = set()
-
+CLIENTS: set[Any] | set[Client] = set()
+db = CaptionStore()
 
 async def broadcast_naively(raw_message: str) -> None:
     """Send one message directly to every connected client.
@@ -54,6 +89,22 @@ async def broadcast_naively(raw_message: str) -> None:
         if isinstance(result, Exception):
             CLIENTS.discard(client)
 
+async def broadcast(raw_message: str) -> None:
+    """
+    Put the message into all clients' queue.
+    """
+    if not CLIENTS:
+        return
+
+    snapshot = list(CLIENTS)
+
+    for client in snapshot:
+        client.queue.put_nowait(raw_message)
+
+async def unicast(client) -> None:
+    while True:
+        msg = await client.queue.get()
+        await client.ws.send(msg)
 
 async def handle_source(ws, hello: dict[str, Any]) -> None:
     session = hello.get("session")
@@ -70,7 +121,10 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
             if msg_type == "CAPTION_UPDATE":
                 # Baseline behavior: forward exactly what was received.
                 # No history, state, validation, coalescing, or bounded queues.
-                await broadcast_naively(raw)
+                if NAIVE:
+                    await broadcast_naively(raw)
+                else:
+                    await broadcast(raw)
             elif msg_type == "SOURCE_DONE":
                 # Test-control message. The specification does not require it
                 # to be forwarded to clients.
@@ -82,13 +136,18 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
     finally:
         print("source disconnected", flush=True)
 
-
+"""
+Handle client's connection to the server for the whole connection, including
+resuming connection state.
+"""
 async def handle_client(ws, hello: dict[str, Any]) -> None:
     client_id = hello.get("client_id")
 
     # The baseline has no stored recovery state. Sending an empty HISTORY makes
     # the connection behavior visible and keeps the starter easy to inspect.
     # Students must implement correct HISTORY semantics for the assignment.
+
+    # naive: just keep sending latest segment
     await ws.send(json.dumps({"type": "HISTORY", "items": []}))
 
     CLIENTS.add(ws)
@@ -102,6 +161,50 @@ async def handle_client(ws, hello: dict[str, Any]) -> None:
         CLIENTS.discard(ws)
         print(f"client disconnected: id={client_id}; clients={len(CLIENTS)}", flush=True)
 
+"""
+Checks if a client has been connected before.
+
+If yes, it will send based on the information like the last segment and rev,
+and for how long does the client want to receive. (Whole segment is received)
+!!! Client should make sure to check its own buffer for how long does it store
+instead of keep on requesting.
+
+If no, it will add the client to the CLIENTS list and return the past 30 seconds
+worth of transcriptions.
+
+Vulnerability: Only validates client_id, vulnerable to spoofing
+TODO: deduplicate client_id
+"""
+async def handle_client_new(ws, hello: dict[str, Any]) -> None:
+    # format hello message
+    client_id = hello.get("client_id")
+    session = hello.get("session") # not used
+    last_segment = int(hello.get("last_segment", 0))
+    last_revision = int(hello.get("last_revision", 0))
+    history_seconds = max(min(int(hello.get("history_seconds", 30)), 60), 0)
+    history = db.get_history(last_segment, last_revision, history_seconds)
+    history_msg = json.dumps({
+                "type": "HISTORY",
+                "items": [json.loads(entry.raw) for entry in (history or [])],
+            })
+    
+    client = Client(ws=ws, client_id=client_id)
+    client.queue.put_nowait(history_msg)
+    CLIENTS.add(client)
+    sender = asyncio.create_task(unicast(client))
+    
+    if last_segment == 0 and last_revision == 0:
+        print(f"client connected: id={client_id}; clients={len(CLIENTS)}", flush=True)
+    else:
+        print(f"client reconnected: id={client_id}; clients={len(CLIENTS)}", flush=True)
+
+    try:
+        async for _ in ws:
+            pass
+    finally:
+        sender.cancel()
+        CLIENTS.discard(client)
+        print(f"client disconnected: id={client_id}; clients={len(CLIENTS)}", flush=True)
 
 async def handler(ws) -> None:
     try:
@@ -115,7 +218,10 @@ async def handler(ws) -> None:
     if msg_type == "SOURCE_HELLO":
         await handle_source(ws, hello)
     elif msg_type == "CLIENT_HELLO":
-        await handle_client(ws, hello)
+        if NAIVE:
+            await handle_client(ws, hello)
+        else:
+            await handle_client_new(ws, hello)
     else:
         await ws.close(code=1008, reason="Expected SOURCE_HELLO or CLIENT_HELLO")
 
