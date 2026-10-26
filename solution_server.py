@@ -41,8 +41,30 @@ class Client:
         self.ws = ws
         self.client_id = client_id
         # Used to eliminate HOL blocking
-        self.queue: asyncio.Queue[str] = asyncio.Queue(maxsize=maxsize)
+        # self.queue: asyncio.Queue[str] = asyncio.Queue(maxsize=maxsize)
+        self.ready = asyncio.Event()
+        self.maxsize = maxsize
+        self.order = deque()
+        self.pending: dict[int, str] = {}
 
+    def enqueue(self, segment, raw) -> bool:
+        if segment in self.pending:
+            self.pending[segment] = raw
+        else:
+            if len(self.order) == self.maxsize:
+                return False
+            else:
+                self.order.append(segment)
+                self.pending.update({segment:raw})
+
+        self.ready.set()
+        return True
+
+    def dequeue(self) -> bool:
+        segment = self.order.popleft()
+        msg = self.pending.pop(segment)
+        return msg
+    
 CLIENTS: set[Any] | set[Client] = set()
 from server.store import CaptionStore, Entry, ACCEPTED
 # Global caption store, used by all source connections. 
@@ -72,7 +94,7 @@ async def broadcast_naively(raw_message: str) -> None:
         if isinstance(result, Exception):
             CLIENTS.discard(client)
 
-async def broadcast(raw_message: str) -> None:
+async def broadcast(segment, raw_message: str) -> None:
     """
     Put the message into all clients' queue.
     """
@@ -86,17 +108,18 @@ async def broadcast(raw_message: str) -> None:
     # Client to re-establish a connection to prevent client queue from
     # getting too big
     for client in snapshot:
-        try:
-            client.queue.put_nowait(raw_message)
-        except asyncio.QueueFull:
+        if not client.enqueue(segment, raw_message):
             CLIENTS.discard(client)
             asyncio.create_task(client.ws.close(code=1013, reason="client too slow"))
 
 async def unicast(client) -> None:
     try:
         while True:
-            msg = await client.queue.get()
-            await client.ws.send(msg)
+            await client.ready.wait()
+            while client.order:
+                msg = client.dequeue()
+                await client.ws.send(msg)
+            client.ready.clear()
     except websockets.ConnectionClosed:
         pass
 
@@ -144,7 +167,7 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
                     if NAIVE:
                         await broadcast_naively(raw)      # temporary, as before
                     else:
-                        await broadcast(raw)
+                        await broadcast(entry.segment, raw)
 
             elif msg_type == "SOURCE_DONE":
                 # Test-control message. The specification does not require it
@@ -216,14 +239,15 @@ async def handle_client_new(ws, hello: dict[str, Any]) -> None:
     last_segment = int(hello.get("last_segment", 0))
     last_revision = int(hello.get("last_revision", 0))
     history_seconds = max(min(int(hello.get("history_seconds", 30)), 60), 0)
+
     history = store.get_history(last_segment, last_revision, history_seconds)
-    history_msg = json.dumps({
-                "type": "HISTORY",
-                "items": [json.loads(entry.raw) for entry in (history or [])],
-            })
+    raw = json.dumps({
+                        "type": "HISTORY",
+                        "items": [json.loads(e.raw) for e in history],
+                    })
     
     client = Client(ws=ws, client_id=client_id)
-    client.queue.put_nowait(history_msg)
+    client.enqueue(-1, raw)
     CLIENTS.add(client)
     sender = asyncio.create_task(unicast(client))
     
