@@ -27,6 +27,7 @@ import argparse
 import asyncio
 import json
 from typing import Any
+from collections import Counter
 
 import websockets
 
@@ -46,6 +47,11 @@ async def broadcast_naively(raw_message: str) -> None:
     sends to complete. Under pressure, this design may accumulate delay and is
     not the target architecture for the assignment.
     """
+    
+    # Testing for Source - Server
+    print("broadcasting to %d clients: %s", len(CLIENTS), raw_message, flush=True)
+    
+    
     if not CLIENTS:
         return
 
@@ -77,25 +83,35 @@ def parse_update(msg: dict, raw: str) -> Entry | None:
 async def handle_source(ws, hello: dict[str, Any]) -> None:
     session = hello.get("session")
     print(f"source connected: session={session}", flush=True)
-
+    stats = Counter()
     try:
         async for raw in ws:
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
+                stats["bad_json"] += 1
+                continue
+            if not isinstance(msg, dict):
+                stats["not_object"] += 1
                 continue
 
             msg_type = msg.get("type")
             if msg_type == "CAPTION_UPDATE":
                 entry = parse_update(msg, raw)
                 if entry is None:
-                    continue                                  # TODO: Decide if throw error # malformed: ignore, don't crash
-                if store.apply(entry) == ACCEPTED:
-                    await broadcast_naively(raw)    
+                    stats["invalid"] += 1
+                    continue
+                result = store.apply(entry)
+                stats[result] += 1
+                print(f"  seg {entry.segment:>3} rev {entry.revision} "
+                      f"{'FINAL' if entry.final else 'draft'} -> {result}", flush=True)
+                if result == ACCEPTED:
+                    await broadcast_naively(raw)      # temporary, as before
             elif msg_type == "SOURCE_DONE":
                 # Test-control message. The specification does not require it
                 # to be forwarded to clients.
                 print("source finished", flush=True)
+                dump_store(stats)
             else:
                 # Forward compatibility: ignore fields/messages this baseline
                 # doesn't understand rather than crashing.
@@ -103,7 +119,18 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
     finally:
         print("source disconnected", flush=True)
 
-
+def dump_store(stats):
+    print("---- store summary ----")
+    print("results     :", dict(stats))
+    print("entries     :", len(store.entries))
+    print("earliest    :", store.earliest, " latest:", store.latest)
+    print("contig_final:", store.contig_final)
+    print("active      :", [e.segment for e in store.active()])
+    for s in store.order:
+        e = store.entries[s]
+        print(f"  seg {s:>3} rev {e.revision} {'FINAL' if e.final else 'draft'} ts={e.source_ts:.3f} {e.text[:40]!r}")
+        
+        
 async def handle_client(ws, hello: dict[str, Any]) -> None:
     client_id = hello.get("client_id")
 
