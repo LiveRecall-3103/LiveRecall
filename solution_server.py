@@ -30,10 +30,14 @@ from typing import Any
 
 import websockets
 
+from server.store import CaptionStore, Entry, ACCEPTED
+
 # Naive global set of currently connected student clients.
 # There is deliberately no per-client queue or recovery state here.
 CLIENTS: set[Any] = set()
 
+# Global caption store, used by all source connections. 
+store = CaptionStore(keep_seconds=120.0, max_items=500)
 
 async def broadcast_naively(raw_message: str) -> None:
     """Send one message directly to every connected client.
@@ -55,6 +59,21 @@ async def broadcast_naively(raw_message: str) -> None:
             CLIENTS.discard(client)
 
 
+# ---- message parsing for source updates ------------------------------------------------------
+def parse_update(msg: dict, raw: str) -> Entry | None:
+    try:
+        seg, rev = msg["segment"], msg["revision"]
+        fin, ts, text = msg["final"], msg["source_ts"], msg["text"]
+    except KeyError:
+        return None
+    if type(seg) is not int or type(rev) is not int or seg < 1 or rev < 1:
+        return None
+    if type(fin) is not bool or not isinstance(text, str):
+        return None
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return None
+    return Entry(seg, rev, fin, float(ts), text, raw)
+
 async def handle_source(ws, hello: dict[str, Any]) -> None:
     session = hello.get("session")
     print(f"source connected: session={session}", flush=True)
@@ -68,9 +87,11 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
 
             msg_type = msg.get("type")
             if msg_type == "CAPTION_UPDATE":
-                # Baseline behavior: forward exactly what was received.
-                # No history, state, validation, coalescing, or bounded queues.
-                await broadcast_naively(raw)
+                entry = parse_update(msg, raw)
+                if entry is None:
+                    continue                                  # TODO: Decide if throw error # malformed: ignore, don't crash
+                if store.apply(entry) == ACCEPTED:
+                    await broadcast_naively(raw)    
             elif msg_type == "SOURCE_DONE":
                 # Test-control message. The specification does not require it
                 # to be forwarded to clients.
