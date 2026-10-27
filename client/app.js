@@ -11,7 +11,7 @@
  *   - replace revisions rather than appending duplicates   [Done]
  *   - maintain >=60 s of finalized local state             [Done]
  *   - implement 30 s default recall + 15/30/60 s views     [Done]
- *   - automatic reconnect + correct resume state
+ *   - automatic reconnect + correct resume state           [Done]
  *   - HISTORY merge/deduplication
  *   - usable final UI
  */
@@ -19,6 +19,8 @@
 class FrontEndRenderer {
     element;
     segments = {};
+    lastSegmentId = 0;
+    lastRevisionId = 0;
 
     constructor(element) {
         this.element = element;
@@ -115,6 +117,8 @@ class FrontEndRenderer {
             row.classList.remove("is-final");
         }
 
+        this.lastSegmentId = segment_id;
+        this.lastRevisionId = revision_id;
         this.refresh(has_new_segment);
     }
 }
@@ -128,6 +132,7 @@ const live_caption_renderer = new FrontEndRenderer(liveEl);
 
 let ws;
 let recallSeconds = 30;
+let backoff = 500;
 
 function checkTimeInRange(segment, window) {
     const cutoff = Date.now() / 1000 - window;
@@ -154,6 +159,14 @@ function numericClientId() {
   return Number(value);
 }
 
+function getLastSegmentId() {
+    return live_caption_renderer.lastSegmentId;
+}
+
+function getLastRevisionId() {
+    return live_caption_renderer.lastRevisionId;
+}
+
 function appendNaively(msg) {
   const row = document.createElement("div");
   row.className = "naive-line";
@@ -167,7 +180,6 @@ function appendImpl(msg) {
     live_caption_renderer.append(msg);
 }
 
-
 function connect() {
   statusEl.textContent = "connecting";
   ws = new WebSocket(WS_URL);
@@ -178,9 +190,9 @@ function connect() {
       type: "CLIENT_HELLO",
       client_id: numericClientId(),
       session: "L1",
-      last_segment: 0,       // TODO: resume latest finalized state
-      last_revision: 0,
-      history_seconds: 30
+      last_segment: getLastSegmentId(),       // TODO: resume latest finalized state
+      last_revision: getLastRevisionId(),
+      history_seconds: 60
     }));
   });
 
@@ -194,9 +206,15 @@ function connect() {
     }
   });
 
-  ws.addEventListener("close", () => {
+  ws.addEventListener("close", (event) => {
     statusEl.textContent = "disconnected";
     // TODO: automatic reconnect after a short delay, using finalized resume state.
+    if (event.code === 1008) {
+        statusEl.textContent = `closed by server: ${event.reason}`;
+        return;
+    }
+    statusEl.textContent = `reconnecting in ${backoff / 1000}s`;
+    setTimeout(connect, backoff);
   });
 
   ws.addEventListener("error", () => {
@@ -279,4 +297,4 @@ setInterval(() => {
     }, 1000);
 
 // To run the test in your console, just call:
-runMassiveOutOfOrderTest();
+// runMassiveOutOfOrderTest();
