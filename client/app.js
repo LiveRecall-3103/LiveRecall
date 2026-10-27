@@ -12,7 +12,7 @@
  *   - maintain >=60 s of finalized local state             [Done]
  *   - implement 30 s default recall + 15/30/60 s views     [Done]
  *   - automatic reconnect + correct resume state           [Done]
- *   - HISTORY merge/deduplication
+ *   - HISTORY merge/deduplication                          [Done]
  *   - usable final UI
  */
 
@@ -203,6 +203,10 @@ function connect() {
     } else if (msg.type === "HISTORY") {
       console.log(`HISTORY with ${msg.items?.length ?? 0} item(s)`, msg);
       // TODO: merge history without stale/duplicate final captions.
+      for (const message of msg.items) {
+        appendImpl(message);
+      }
+      live_caption_renderer.prune()
     }
   });
 
