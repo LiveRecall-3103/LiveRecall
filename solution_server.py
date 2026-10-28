@@ -31,8 +31,8 @@ LAG_WINDOW_DROP = VERSION >= 3
 BATCH_FINALS = VERSION >= 4
 LOOKUP_WHEN_LAGGING = VERSION >= 5
 
-MAX_LAG_WINDOW = 10.0
-LAG_ENTER = 0.3
+MAX_LAG_WINDOW = 2.0
+LAG_ENTER = 0.5
 LAG_EXIT_AGE = 0.3
 LAG_EXIT_RTT = 0.2
 
@@ -199,7 +199,15 @@ class Client:
         global BATCHES, BATCHED_FINALS, PROV_SENT_LAG
 
         missing = store.finals_after_segment(self.last_final_sent)
-
+        print(
+            "[LAG_RECOVERY]",
+            "client", self.client_id,
+            "cursor", self.last_final_sent,
+            "missing", len(missing),
+            "newest_final", store.newest_final_seg(),
+            "store_entries", len(store.entries),
+            flush=True,
+        )
         if len(missing) > 1:
             self.last_final_sent = missing[-1].segment
             self._purge_sent_finals()
