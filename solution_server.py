@@ -34,7 +34,10 @@ from collections import Counter
 import time
 import websockets
 
-NAIVE = False
+from config import VERSION
+
+NAIVE = VERSION == 0
+PING_FLOW_CONTROL = VERSION >= 2
 MAX_LAG_WINDOW = 3.00
 
 # Updated clients class
@@ -127,7 +130,8 @@ async def unicast(client) -> None:
             while client.order:
                 msg = client.dequeue()
                 await client.ws.send(msg)
-                await (await client.ws.ping())
+                if PING_FLOW_CONTROL:
+                    await (await client.ws.ping())
 
             client.ready.clear()
     except websockets.ConnectionClosed:
@@ -269,6 +273,8 @@ async def handle_client_new(ws, hello: dict[str, Any]) -> None:
     try:
         async for _ in ws:
             pass
+    except websockets.ConnectionClosed:
+        pass
     finally:
         sender.cancel()
         CLIENTS.discard(client)
@@ -303,7 +309,7 @@ async def main_async(port: int) -> None:
         ping_interval=20,
         ping_timeout=20,
     ):
-        print(f"LiveRecall baseline listening on ws://0.0.0.0:{port}", flush=True)
+        print(f"LiveRecall v{VERSION} listening on ws://0.0.0.0:{port}", flush=True)
         await asyncio.Future()
 
 
