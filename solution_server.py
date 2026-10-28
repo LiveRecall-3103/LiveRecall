@@ -1,24 +1,14 @@
 #!/usr/bin/env python3
 """
-CS3103 Assignment 4 - LiveRecall naive working baseline.
+CS3103 Assignment 4 - LiveRecall server.
 
-This starter is intentionally useful but incomplete. It provides the required
-CLI and a basic WebSocket broadcaster so that caption_source.py -> server ->
-browser/load clients works on day one.
-
-It DOES NOT implement the graded networking mechanisms:
-  - revision-state management or deduplication
-  - recent-history recovery or late-join recovery
-  - bounded per-client application queues
-  - slow-client isolation
-  - semantic coalescing / backpressure
-  - constrained-bandwidth overload handling
-
-Required evaluator command:
-    python solution_server.py --port 8765
-
-Teams should replace or substantially extend the implementation while keeping
-this command-line interface and the protocol in the assignment specification.
+Versions (config.VERSION):
+  0  naive broadcast
+  2  per-client queue + ping flow control
+  3  + lag-window disconnect
+  4  + mass send: a lagging client receives all finals it lacks as ONE HISTORY
+  5  + lookup at send time: a lagging client holds no queue; finals and the
+       newest provisional are read from the store right before sending
 """
 
 from __future__ import annotations
@@ -27,12 +17,9 @@ import argparse
 import asyncio
 import json
 import time
-from collections import deque
-from dataclasses import dataclass
+from collections import Counter, deque
 from typing import Any
-from collections import Counter
 
-import time
 import websockets
 
 from config import VERSION
@@ -41,32 +28,34 @@ from server.store import CaptionStore, Entry, ACCEPTED
 NAIVE = VERSION == 0
 PING_FLOW_CONTROL = VERSION >= 2
 LAG_WINDOW_DROP = VERSION >= 3
-BATCH_FINALS = VERSION >= 4
+BATCH_FINALS = VERSION >= 4            # opt 2
+LOOKUP_WHEN_LAGGING = VERSION >= 5     # opt 3
 
 MAX_LAG_WINDOW = 10.0   # s: oldest queued item older than this -> disconnect (V3)
-LAG_ENTER = 1.0         # s: queue age or pong RTT above this -> lagging
-LAG_EXIT_AGE = 0.3      # s: queue age must fall below this ...
-LAG_EXIT_RTT = 0.2      # s: ... and pong RTT below this -> back to normal
+LAG_ENTER = 1.0         # s: queue age / pong RTT / in-flight wait above this -> lagging
+LAG_EXIT_AGE = 0.3      # s: (V4) queue age must fall below this ...
+LAG_EXIT_RTT = 0.2      # s: ... and pong RTT below this -> back to full updates
 
-# Performance counter: clients disconnected by the lag-window check (V3)
-LAG_DROPS = 0
-
-# Updated clients class
-BATCHES = 0             # mass sends performed (V4)
-BATCHED_FINALS = 0      # finals delivered inside those mass sends
+# Counters for the report
+LAG_DROPS = 0           # clients disconnected by the lag-window check
+LAG_ENTRIES = 0         # times any client entered lag mode
+BATCHES = 0             # mass sends
+BATCHED_FINALS = 0      # finals delivered inside mass sends
+LAG_ABSORBED = 0        # source updates not queued because the client was lagging (V5)
+PROV_SENT_LAG = 0       # provisionals actually sent from store lookup (V5)
 
 
 # ---------------------------------------------------------------------------
 # Per-client state
 # ---------------------------------------------------------------------------
 class Slot:
-    """One queued segment (newest revision only)."""
+    """One queued segment (newest revision only). Used in normal mode."""
     __slots__ = ("seg", "first_ts", "raw", "final", "alive")
 
     def __init__(self, seg: int, first_ts: float, raw: str, final: bool):
         self.seg = seg
-        self.first_ts = first_ts    # when the segment first entered the queue
-        self.raw = raw              # newest revision's JSON
+        self.first_ts = first_ts    # when the segment first entered the queue (never reset)
+        self.raw = raw
         self.final = final
         self.alive = True           # False = tombstone left in `order`
 
@@ -75,21 +64,22 @@ class Client:
     def __init__(self, ws, client_id, maxsize: int = 100):
         self.ws = ws
         self.client_id = client_id
-        # Used to eliminate HOL blocking
-        # self.queue: asyncio.Queue[str] = asyncio.Queue(maxsize=maxsize)
         self.ready = asyncio.Event()
         self.maxsize = maxsize
 
+        # ---- normal-mode queue (every revision, FIFO, coalesced per segment)
         self.initial: str | None = None       # late-join / resume HISTORY
-        self.slots: dict[int, Slot] = {}      # segment -> live slot (coalescing)
+        self.slots: dict[int, Slot] = {}      # segment -> live slot
         self.order: deque[Slot] = deque()     # FIFO, may hold tombstones
 
-        # Cursor: highest final segment already sent to this client.
+        # ---- cursors: O(1) state that replaces the queue while lagging
         # TCP is reliable and ordered, so "sent" == "will be received".
-        self.last_final_sent = 0
+        self.last_final_sent = 0              # highest final segment sent
+        self.last_prov = (0, 0)               # (segment, revision) last provisional sent in lag mode
 
-        # Lag state
-        self.rtt = 0.0
+        # ---- lag state
+        self.rtt = 0.0                        # last send -> pong time
+        self.inflight_since: float | None = None   # set while awaiting a send/pong
         self.lagging = False
 
     # ---- queries ------------------------------------------------------------
@@ -104,22 +94,44 @@ class Client:
             now = time.monotonic()
         return now - self.order[0].first_ts
 
+    # ---- lag detection --------------------------------------------------------
+    def maybe_enter_lag(self) -> None:
+        """Cheap O(1) check, run on every enqueue and every send decision."""
+        global LAG_ENTRIES
+        if self.lagging:
+            return
+        now = time.monotonic()
+        waiting = (now - self.inflight_since) if self.inflight_since is not None else 0.0
+        if self.oldest_age(now) > LAG_ENTER or max(self.rtt, waiting) > LAG_ENTER:
+            self.lagging = True
+            LAG_ENTRIES += 1
+            if LOOKUP_WHEN_LAGGING:
+                self._clear_queue()           # the store now supplies everything
+
     # ---- producer side --------------------------------------------------------
-    def set_initial(self, raw: str, last_final: int) -> None:
-        """Store the HISTORY reply and start the cursor at the newest final in it."""
+    def set_initial(self, raw: str) -> None:
         self.initial = raw
-        self.last_final_sent = max(self.last_final_sent, last_final)
         self.ready.set()
 
     def enqueue(self, segment: int, raw: str, final: bool = False) -> bool:
         """Queue one revision. Returns False if the client must be cut off."""
-        global LAG_DROPS
-        slot = self.slots.get(segment)
+        global LAG_DROPS, LAG_ABSORBED
 
+        if BATCH_FINALS:
+            self.maybe_enter_lag()
+
+        # V5 lag mode: the store is the source of truth. Keep NO per-client copy;
+        # just wake the sender, which looks up the newest state right before sending.
+        if LOOKUP_WHEN_LAGGING and self.lagging:
+            LAG_ABSORBED += 1
+            self.ready.set()
+            return True
+
+        slot = self.slots.get(segment)
         if slot is not None:
             if slot.final:
-                return True                  # a final is never replaced
-            slot.raw = raw                   # coalesce, keep original age
+                return True                   # a final is never replaced
+            slot.raw = raw                    # coalesce, keep original age
             slot.final = final
         else:
             if len(self.slots) >= self.maxsize:
@@ -136,44 +148,63 @@ class Client:
         self.ready.set()
         return True
 
-    # ---- lag detection --------------------------------------------------------
-    def update_mode(self) -> None:
-        """Hysteresis: enter lag above LAG_ENTER, leave only when both signals are low."""
-        age = self.oldest_age()
-        if not self.lagging:
-            if age > LAG_ENTER or self.rtt > LAG_ENTER:
-                self.lagging = True
-        elif age < LAG_EXIT_AGE and self.rtt < LAG_EXIT_RTT:
-            self.lagging = False
-
-    # ---- consumer side: THE sending decision -----------------------------------
+    # ---- consumer side: THE sending decision ------------------------------------
     def next_message(self, store: CaptionStore) -> str | None:
-        """Called each time the previous send (and pong) has completed."""
-        global BATCHES, BATCHED_FINALS
+        """Called after the previous send AND its pong completed. Returns the next
+        wire message, or None if there is nothing to send right now."""
+        global BATCHES, BATCHED_FINALS, PROV_SENT_LAG
 
         # 1. Late-join / resume HISTORY always goes first, untouched.
         if self.initial is not None:
             raw, self.initial = self.initial, None
             return raw
 
-        # 2. Lagging and the client lacks 2+ finals -> one mass send.
-        if BATCH_FINALS:
-            self.update_mode()
-            if self.lagging:
-                missing = store.finals_after_segment(self.last_final_sent)
-                if len(missing) > 1:
-                    self.last_final_sent = missing[-1].segment
-                    self._purge_sent_finals()
-                    BATCHES += 1
-                    BATCHED_FINALS += len(missing)
-                    # each raw is already a valid JSON object: join, don't re-encode
-                    return '{"type":"HISTORY","items":[' + ",".join(e.raw for e in missing) + "]}"
+        if not BATCH_FINALS:
+            return self._pop_next()
 
-        # 3. Otherwise normal FIFO (every revision, in order).
-        return self._pop_next()
+        self.maybe_enter_lag()
+        if not self.lagging:
+            return self._pop_next()            # normal: every revision, in order
 
-    # ---- internals --------------------------------------------------------------
+        # ---- lagging: decide from current state, not from queue order ----------
+        # 2. Finals the client lacks (cursor vs the store's newest final).
+        missing = store.finals_after_segment(self.last_final_sent)
+
+        if len(missing) > 1:                   # gap -> ONE message for the whole gap
+            self.last_final_sent = missing[-1].segment
+            self._purge_sent_finals()          # V4 only has queued copies; V5 queue is empty
+            BATCHES += 1
+            BATCHED_FINALS += len(missing)
+            # raws are already valid JSON objects: join instead of re-encoding
+            return '{"type":"HISTORY","items":[' + ",".join(e.raw for e in missing) + "]}"
+
+        if not LOOKUP_WHEN_LAGGING:
+            # V4: the queue still exists. Leave lag mode once the client has caught up.
+            if self.oldest_age() < LAG_EXIT_AGE and self.rtt < LAG_EXIT_RTT:
+                self.lagging = False
+            return self._pop_next()
+
+        # ---- V5: pure store lookup ------------------------------------------------
+        if missing:                            # exactly one final: send it as-is
+            self.last_final_sent = missing[0].segment
+            return missing[0].raw
+
+        # 3. No finals missing: newest provisional, read NOW (never stored earlier),
+        #    only for segments the client does not already hold a final for.
+        prov = store.newest_active_after(self.last_final_sent)
+        if prov is not None and (prov.segment, prov.revision) != self.last_prov:
+            self.last_prov = (prov.segment, prov.revision)
+            PROV_SENT_LAG += 1
+            return prov.raw
+
+        # 4. Fully caught up. If the client is responsive again, resume full updates.
+        if self.rtt < LAG_EXIT_RTT:
+            self.lagging = False
+        return None                            # sender sleeps until the next enqueue
+
+    # ---- internals ----------------------------------------------------------------
     def _pop_next(self) -> str | None:
+        """Normal-mode FIFO. Skips finals already delivered inside a HISTORY batch."""
         while True:
             self._trim_order()
             if not self.order:
@@ -182,19 +213,20 @@ class Client:
             self._kill(slot)
             if slot.final:
                 if BATCH_FINALS and slot.seg <= self.last_final_sent:
-                    continue                 # already delivered inside a HISTORY batch
+                    continue
                 self.last_final_sent = max(self.last_final_sent, slot.seg)
             return slot.raw
 
     def _purge_sent_finals(self) -> None:
-        """After a mass send, kill queued finals the batch already covered.
-
-        This shrinks the queue and lowers oldest_age so the client can leave
-        lag mode once it catches up. Runs once per batch (queue <= maxsize).
-        """
         for slot in [s for s in self.slots.values()
                      if s.final and s.seg <= self.last_final_sent]:
             self._kill(slot)
+
+    def _clear_queue(self) -> None:
+        for s in self.slots.values():
+            s.alive = False
+        self.slots.clear()
+        self.order.clear()
 
     def _kill(self, slot: Slot) -> None:
         slot.alive = False
@@ -205,7 +237,7 @@ class Client:
             self.order.popleft()
 
     def _maybe_compact(self) -> None:
-        if len(self.order) > 2 * self.maxsize:
+        if len(self.order) > 2 * self.maxsize:     # bound tombstones
             self.order = deque(s for s in self.order if s.alive)
 
 
@@ -232,8 +264,8 @@ async def broadcast_naively(raw_message: str) -> None:
 
 
 async def broadcast(segment: int, raw_message: str, final: bool) -> None:
-    """Put the message into every client's queue. Never awaits, so store.apply
-    and this enqueue are atomic with respect to the sender tasks."""
+    """Enqueue into every client. No await inside, so store.apply and all enqueues
+    happen with no task switch in between (a batch can't miss or double-send)."""
     if not CLIENTS:
         return
     for client in list(CLIENTS):
@@ -246,16 +278,19 @@ async def unicast(client: Client) -> None:
     try:
         while True:
             await client.ready.wait()
-            while client:
+            client.ready.clear()               # clear BEFORE draining: a wake-up that
+                                               # arrives mid-drain is never lost
+            while True:
                 msg = client.next_message(store)
                 if msg is None:
                     break
+                t0 = time.monotonic()
+                client.inflight_since = t0     # lets lag detection see a stuck send
                 await client.ws.send(msg)
                 if PING_FLOW_CONTROL:
-                    t0 = time.monotonic()
                     await (await client.ws.ping())
-                    client.rtt = time.monotonic() - t0   # drives update_mode()
-            client.ready.clear()
+                client.rtt = time.monotonic() - t0
+                client.inflight_since = None
     except websockets.ConnectionClosed:
         pass
 
@@ -317,11 +352,13 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
 
 def dump_store(stats) -> None:
     print("---- store summary ----")
-    print("results     :", dict(stats))
-    print("entries     :", len(store.entries))
-    print("earliest    :", store.earliest, " latest:", store.latest)
-    print("contig_final:", store.contig_final)
-    print("batches     :", BATCHES, " finals in batches:", BATCHED_FINALS)
+    print("results      :", dict(stats))
+    print("entries      :", len(store.entries))
+    print("earliest     :", store.earliest, " latest:", store.latest)
+    print("contig_final :", store.contig_final)
+    print("lag entries  :", LAG_ENTRIES, " lag drops:", LAG_DROPS)
+    print("batches      :", BATCHES, " finals in batches:", BATCHED_FINALS)
+    print("lag absorbed :", LAG_ABSORBED, " provisionals sent from lookup:", PROV_SENT_LAG)
 
 
 # ---------------------------------------------------------------------------
@@ -350,14 +387,17 @@ async def handle_client_new(ws, hello: dict[str, Any]) -> None:
     except (TypeError, ValueError):
         last_segment, last_revision, history_seconds = 0, 0, 30
 
+    # Everything below up to CLIENTS.add() is synchronous: no update can slip in
+    # between the history snapshot and the client starting to receive live updates.
     history = store.get_history(last_segment, last_revision, history_seconds)
     raw = json.dumps({"type": "HISTORY", "items": [json.loads(e.raw) for e in history]})
 
     client = Client(ws=ws, client_id=client_id)
-    # Cursor starts at the newest final the client will hold after this HISTORY.
-    newest = history[-1].segment if history else 0
-    client.last_final_sent = max(0, last_segment)
-    client.set_initial(raw, newest)
+    # Cursor = newest final that exists right now. Finals up to here are either in
+    # the HISTORY just built or deliberately outside the requested window; later
+    # finals arrive live. So a later mass send never re-sends or over-sends.
+    client.last_final_sent = max(max(0, last_segment), store.newest_final_seg())
+    client.set_initial(raw)
     CLIENTS.add(client)
     sender = asyncio.create_task(unicast(client))
 
@@ -404,14 +444,16 @@ def print_queue() -> None:
     if NAIVE or not CLIENTS:
         return
     lens = [len(c) for c in CLIENTS]
-    lagging = sum(1 for c in CLIENTS if c.lagging)
-    print("[PROFILE_QUEUE_LENGTH]", "average", time.monotonic(),
+    now = time.monotonic()
+    print("[PROFILE_QUEUE_LENGTH]", "average", now,
           sum(lens) / len(lens), "max", max(lens), flush=True)
     if LAG_WINDOW_DROP:
-        print("[PROFILE_LAG_DROPS]", time.monotonic(), LAG_DROPS, flush=True)
+        print("[PROFILE_LAG_DROPS]", now, LAG_DROPS, flush=True)
     if BATCH_FINALS:
-        print("[PROFILE_BATCH]", time.monotonic(), "lagging", lagging,
-              "batches", BATCHES, "finals_batched", BATCHED_FINALS, flush=True)
+        lagging = sum(1 for c in CLIENTS if c.lagging)
+        print("[PROFILE_BATCH]", now, "lagging", lagging, "batches", BATCHES,
+              "finals_batched", BATCHED_FINALS, "absorbed", LAG_ABSORBED,
+              "prov_sent_lag", PROV_SENT_LAG, flush=True)
 
 
 async def monitor_fn(interval: float = 1.0) -> None:

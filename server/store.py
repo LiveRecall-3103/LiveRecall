@@ -138,11 +138,8 @@ class CaptionStore:
     
     def finals_after_segment(self, seg: int) -> list[Entry]:
         """All finals held with segment > seg, oldest -> newest.
-
-        Used for mid-stream catch-up of a lagging client. `order` is ascending,
-        so we walk from the newest end and stop at the first segment the client
-        already has. Cost is O(finals returned), not O(store size).
-        """
+        `order` is ascending, so walk from the newest end and stop at the first
+        segment the client already has. Cost is O(finals returned)."""
         out: list[Entry] = []
         for s in reversed(self.order):
             if s <= seg:
@@ -152,3 +149,20 @@ class CaptionStore:
                 out.append(e)
         out.reverse()
         return out
+
+    def newest_active_after(self, seg: int) -> Entry | None:
+        """Newest non-final entry with segment > seg, else None."""
+        for s in reversed(self.order):
+            if s <= seg:
+                break
+            e = self.entries[s]
+            if not e.final:
+                return e
+        return None
+
+    def newest_final_seg(self) -> int:
+        """Highest final segment currently held (0 if none)."""
+        for s in reversed(self.order):
+            if self.entries[s].final:
+                return s
+        return 0
