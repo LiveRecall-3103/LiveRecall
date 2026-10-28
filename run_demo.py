@@ -68,7 +68,7 @@ def one_run(args, run_no, here):
         print(f"Clients={args.clients}, duration={args.duration}s, source segments={segments}")
 
         server = subprocess.Popen(
-            [sys.executable, "-u", "solution_server.py", "--port", str(args.port)],
+            [sys.executable, "-u", args.server, "--port", str(args.port)],
             cwd=here,
             stdout=subprocess.DEVNULL if args.quiet_server else None,
             stderr=subprocess.STDOUT if args.quiet_server else None,
@@ -123,7 +123,7 @@ def one_run(args, run_no, here):
         return summary
     finally:
         terminate_process(clients, "load_clients.py")
-        terminate_process(server, "solution_server.py")
+        terminate_process(server, args.server)
         time.sleep(0.25)
 
 
@@ -182,6 +182,9 @@ def main():
     p.add_argument("--late-seconds", type=float, default=5)
     p.add_argument("--source-start-delay", type=float, default=1.0)
     p.add_argument("--quiet-server", action="store_true")
+    # Added by Claude: choose which server file to test.
+    p.add_argument("--server", default="solution_server.py",
+                   help="Server script to start, e.g. opt_server.py")
     args = p.parse_args()
 
     if args.runs < 1:
@@ -190,7 +193,7 @@ def main():
         p.error("--duration should be > 2 seconds")
 
     here = Path(__file__).resolve().parent
-    for name in ["solution_server.py", "load_clients.py", "caption_source.py", "analyse_results.py"]:
+    for name in [args.server, "load_clients.py", "caption_source.py", "analyse_results.py"]:
         if not (here / name).exists():
             raise SystemExit(f"Required file missing: {name}")
 
