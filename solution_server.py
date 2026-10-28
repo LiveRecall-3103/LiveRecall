@@ -31,9 +31,11 @@ from dataclasses import dataclass
 from typing import Any
 from collections import Counter
 
+import time
 import websockets
 
 NAIVE = False
+MAX_LAG_WINDOW = 3.00
 
 # Updated clients class
 class Client:
@@ -48,21 +50,26 @@ class Client:
         self.pending: dict[int, str] = {}
 
     def enqueue(self, segment, raw) -> bool:
+        now = time.monotonic()
         if segment in self.pending:
-            self.pending[segment] = raw
+            first_ts, _ = self.pending[segment]
+            self.pending[segment] = (first_ts, raw)
         else:
             if len(self.order) == self.maxsize:
                 return False
-            else:
-                self.order.append(segment)
-                self.pending.update({segment:raw})
+            #### Update: if the oldest entry is too far behind, we force client to disconnect (10 seconds)
+            if self.order and now - self.pending[self.order[0]][0] > MAX_LAG_WINDOW:
+                print("Drop packet test", now - self.pending[self.order[0]][0])
+                return False
+            self.order.append(segment)
+            self.pending.update({segment:(now, raw)})
 
         self.ready.set()
         return True
 
     def dequeue(self) -> bool:
         segment = self.order.popleft()
-        msg = self.pending.pop(segment)
+        _, msg = self.pending.pop(segment)
         return msg
     
 CLIENTS: set[Any] | set[Client] = set()

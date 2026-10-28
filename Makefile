@@ -18,3 +18,7 @@ T4:
 	python run_demo.py --clients 100 --duration 60 --runs 3 \
 	--disconnect-percent 20 --disconnect-at 15 --disconnect-seconds 5 \
 	--output-stem t4
+
+SLOW_DISCONNECT:
+	python run_demo.py --clients 1000 --duration 90 --runs 3 \
+	--slow-percent 90 --slow-ms 5000 --output-stem t3_slow
