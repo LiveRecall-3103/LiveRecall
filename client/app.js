@@ -132,7 +132,6 @@ const live_caption_renderer = new FrontEndRenderer(liveEl);
 
 let ws;
 let recallSeconds = 30;
-let backoff = 500;
 
 function checkTimeInRange(segment, window) {
     const cutoff = Date.now() / 1000 - window;
@@ -217,8 +216,7 @@ function connect() {
         statusEl.textContent = `closed by server: ${event.reason}`;
         return;
     }
-    statusEl.textContent = `reconnecting in ${backoff / 1000}s`;
-    setTimeout(connect, backoff);
+    connect();
   });
 
   ws.addEventListener("error", () => {
