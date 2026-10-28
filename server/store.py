@@ -152,13 +152,3 @@ class CaptionStore:
                 out.append(e)
         out.reverse()
         return out
-        def newest_active_after(self, seg: int) -> Entry | None:
-        """Newest non-final entry with segment > seg, else None. O(1) typically."""
-        for s in reversed(self.order):
-            if s <= seg:
-                break
-            e = self.entries[s]
-            if not e.final:
-                return e
-        return None
-    
