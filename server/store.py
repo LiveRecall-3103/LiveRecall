@@ -135,3 +135,20 @@ class CaptionStore:
             out.append(e)
         out.reverse()                              # oldest -> newest, as the spec requires
         return out
+    
+    def finals_after_segment(self, seg: int) -> list[Entry]:
+        """All finals held with segment > seg, oldest -> newest.
+
+        Used for mid-stream catch-up of a lagging client. `order` is ascending,
+        so we walk from the newest end and stop at the first segment the client
+        already has. Cost is O(finals returned), not O(store size).
+        """
+        out: list[Entry] = []
+        for s in reversed(self.order):
+            if s <= seg:
+                break
+            e = self.entries[s]
+            if e.final:
+                out.append(e)
+        out.reverse()
+        return out

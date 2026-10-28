@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
@@ -35,71 +36,191 @@ import time
 import websockets
 
 from config import VERSION
+from server.store import CaptionStore, Entry, ACCEPTED
 
 NAIVE = VERSION == 0
 PING_FLOW_CONTROL = VERSION >= 2
 LAG_WINDOW_DROP = VERSION >= 3
-MAX_LAG_WINDOW = 10.00
+BATCH_FINALS = VERSION >= 4
+
+MAX_LAG_WINDOW = 10.0   # s: oldest queued item older than this -> disconnect (V3)
+LAG_ENTER = 1.0         # s: queue age or pong RTT above this -> lagging
+LAG_EXIT_AGE = 0.3      # s: queue age must fall below this ...
+LAG_EXIT_RTT = 0.2      # s: ... and pong RTT below this -> back to normal
+
 # Performance counter: clients disconnected by the lag-window check (V3)
 LAG_DROPS = 0
 
 # Updated clients class
+BATCHES = 0             # mass sends performed (V4)
+BATCHED_FINALS = 0      # finals delivered inside those mass sends
+
+
+# ---------------------------------------------------------------------------
+# Per-client state
+# ---------------------------------------------------------------------------
+class Slot:
+    """One queued segment (newest revision only)."""
+    __slots__ = ("seg", "first_ts", "raw", "final", "alive")
+
+    def __init__(self, seg: int, first_ts: float, raw: str, final: bool):
+        self.seg = seg
+        self.first_ts = first_ts    # when the segment first entered the queue
+        self.raw = raw              # newest revision's JSON
+        self.final = final
+        self.alive = True           # False = tombstone left in `order`
+
+
 class Client:
-    def __init__(self, ws, client_id, maxsize: int=100):
+    def __init__(self, ws, client_id, maxsize: int = 100):
         self.ws = ws
         self.client_id = client_id
         # Used to eliminate HOL blocking
         # self.queue: asyncio.Queue[str] = asyncio.Queue(maxsize=maxsize)
         self.ready = asyncio.Event()
         self.maxsize = maxsize
-        self.order = deque()
-        self.pending: dict[int, str] = {}
 
-    def enqueue(self, segment, raw) -> bool:
+        self.initial: str | None = None       # late-join / resume HISTORY
+        self.slots: dict[int, Slot] = {}      # segment -> live slot (coalescing)
+        self.order: deque[Slot] = deque()     # FIFO, may hold tombstones
+
+        # Cursor: highest final segment already sent to this client.
+        # TCP is reliable and ordered, so "sent" == "will be received".
+        self.last_final_sent = 0
+
+        # Lag state
+        self.rtt = 0.0
+        self.lagging = False
+
+    # ---- queries ------------------------------------------------------------
+    def __len__(self) -> int:
+        return len(self.slots) + (self.initial is not None)
+
+    def oldest_age(self, now: float | None = None) -> float:
+        self._trim_order()
+        if not self.order:
+            return 0.0
+        if now is None:
+            now = time.monotonic()
+        return now - self.order[0].first_ts
+
+    # ---- producer side --------------------------------------------------------
+    def set_initial(self, raw: str, last_final: int) -> None:
+        """Store the HISTORY reply and start the cursor at the newest final in it."""
+        self.initial = raw
+        self.last_final_sent = max(self.last_final_sent, last_final)
+        self.ready.set()
+
+    def enqueue(self, segment: int, raw: str, final: bool = False) -> bool:
+        """Queue one revision. Returns False if the client must be cut off."""
         global LAG_DROPS
-        now = time.monotonic()
-        if segment in self.pending:
-            first_ts, _ = self.pending[segment]
-            self.pending[segment] = (first_ts, raw)
+        slot = self.slots.get(segment)
+
+        if slot is not None:
+            if slot.final:
+                return True                  # a final is never replaced
+            slot.raw = raw                   # coalesce, keep original age
+            slot.final = final
         else:
-            if len(self.order) == self.maxsize:
+            if len(self.slots) >= self.maxsize:
                 return False
-            #### Update: if the oldest entry is too far behind, we force client to disconnect (MAX_LAG_WINDOW)
-            # Keep MAX_LAG_WINDOW + reconnect delay < history_seconds (30) so HISTORY can fill the gap
-            if LAG_WINDOW_DROP and self.order and now - self.pending[self.order[0]][0] > MAX_LAG_WINDOW:
+            now = time.monotonic()
+            if LAG_WINDOW_DROP and self.oldest_age(now) > MAX_LAG_WINDOW:
                 LAG_DROPS += 1
                 return False
-            self.order.append(segment)
-            self.pending.update({segment:(now, raw)})
+            slot = Slot(segment, now, raw, final)
+            self.slots[segment] = slot
+            self.order.append(slot)
+            self._maybe_compact()
 
         self.ready.set()
         return True
 
-    def dequeue(self) -> bool:
-        segment = self.order.popleft()
-        _, msg = self.pending.pop(segment)
-        return msg
-    
-CLIENTS: set[Any] | set[Client] = set()
-from server.store import CaptionStore, Entry, ACCEPTED
-# Global caption store, used by all source connections. 
+    # ---- lag detection --------------------------------------------------------
+    def update_mode(self) -> None:
+        """Hysteresis: enter lag above LAG_ENTER, leave only when both signals are low."""
+        age = self.oldest_age()
+        if not self.lagging:
+            if age > LAG_ENTER or self.rtt > LAG_ENTER:
+                self.lagging = True
+        elif age < LAG_EXIT_AGE and self.rtt < LAG_EXIT_RTT:
+            self.lagging = False
+
+    # ---- consumer side: THE sending decision -----------------------------------
+    def next_message(self, store: CaptionStore) -> str | None:
+        """Called each time the previous send (and pong) has completed."""
+        global BATCHES, BATCHED_FINALS
+
+        # 1. Late-join / resume HISTORY always goes first, untouched.
+        if self.initial is not None:
+            raw, self.initial = self.initial, None
+            return raw
+
+        # 2. Lagging and the client lacks 2+ finals -> one mass send.
+        if BATCH_FINALS:
+            self.update_mode()
+            if self.lagging:
+                missing = store.finals_after_segment(self.last_final_sent)
+                if len(missing) > 1:
+                    self.last_final_sent = missing[-1].segment
+                    self._purge_sent_finals()
+                    BATCHES += 1
+                    BATCHED_FINALS += len(missing)
+                    # each raw is already a valid JSON object: join, don't re-encode
+                    return '{"type":"HISTORY","items":[' + ",".join(e.raw for e in missing) + "]}"
+
+        # 3. Otherwise normal FIFO (every revision, in order).
+        return self._pop_next()
+
+    # ---- internals --------------------------------------------------------------
+    def _pop_next(self) -> str | None:
+        while True:
+            self._trim_order()
+            if not self.order:
+                return None
+            slot = self.order.popleft()
+            self._kill(slot)
+            if slot.final:
+                if BATCH_FINALS and slot.seg <= self.last_final_sent:
+                    continue                 # already delivered inside a HISTORY batch
+                self.last_final_sent = max(self.last_final_sent, slot.seg)
+            return slot.raw
+
+    def _purge_sent_finals(self) -> None:
+        """After a mass send, kill queued finals the batch already covered.
+
+        This shrinks the queue and lowers oldest_age so the client can leave
+        lag mode once it catches up. Runs once per batch (queue <= maxsize).
+        """
+        for slot in [s for s in self.slots.values()
+                     if s.final and s.seg <= self.last_final_sent]:
+            self._kill(slot)
+
+    def _kill(self, slot: Slot) -> None:
+        slot.alive = False
+        del self.slots[slot.seg]
+
+    def _trim_order(self) -> None:
+        while self.order and not self.order[0].alive:
+            self.order.popleft()
+
+    def _maybe_compact(self) -> None:
+        if len(self.order) > 2 * self.maxsize:
+            self.order = deque(s for s in self.order if s.alive)
+
+
+CLIENTS: set[Any] = set()
+
+# Global caption store, shared by all source connections.
 store = CaptionStore(keep_seconds=120.0, max_items=500)
 
-async def broadcast_naively(raw_message: str) -> None:
-    """Send one message directly to every connected client.
 
-    This is intentionally a naive baseline. The source handler waits for all
-    sends to complete. Under pressure, this design may accumulate delay and is
-    not the target architecture for the assignment.
-    """
-    
-    # Testing for Source - Server
-    print("broadcasting to %d clients: %s", len(CLIENTS), raw_message, flush=True)
-    
-    
+# ---------------------------------------------------------------------------
+# Distribution
+# ---------------------------------------------------------------------------
+async def broadcast_naively(raw_message: str) -> None:
     if not CLIENTS:
         return
-
     snapshot = list(CLIENTS)
     results = await asyncio.gather(
         *(client.send(raw_message) for client in snapshot),
@@ -109,39 +230,39 @@ async def broadcast_naively(raw_message: str) -> None:
         if isinstance(result, Exception):
             CLIENTS.discard(client)
 
-async def broadcast(segment, raw_message: str) -> None:
-    """
-    Put the message into all clients' queue.
-    """
+
+async def broadcast(segment: int, raw_message: str, final: bool) -> None:
+    """Put the message into every client's queue. Never awaits, so store.apply
+    and this enqueue are atomic with respect to the sender tasks."""
     if not CLIENTS:
         return
-
-    snapshot = list(CLIENTS)
-
-    # Claude: suggested me to drop connection if client is too weak
-    # 
-    # Client to re-establish a connection to prevent client queue from
-    # getting too big
-    for client in snapshot:
-        if not client.enqueue(segment, raw_message):
+    for client in list(CLIENTS):
+        if not client.enqueue(segment, raw_message, final):
             CLIENTS.discard(client)
             asyncio.create_task(client.ws.close(code=1013, reason="client too slow"))
 
-async def unicast(client) -> None:
+
+async def unicast(client: Client) -> None:
     try:
         while True:
             await client.ready.wait()
-            while client.order:
-                msg = client.dequeue()
+            while client:
+                msg = client.next_message(store)
+                if msg is None:
+                    break
                 await client.ws.send(msg)
                 if PING_FLOW_CONTROL:
+                    t0 = time.monotonic()
                     await (await client.ws.ping())
-
+                    client.rtt = time.monotonic() - t0   # drives update_mode()
             client.ready.clear()
     except websockets.ConnectionClosed:
         pass
 
-# ---- message parsing for source updates ------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Source side
+# ---------------------------------------------------------------------------
 def parse_update(msg: dict, raw: str) -> Entry | None:
     try:
         seg, rev = msg["segment"], msg["revision"]
@@ -155,6 +276,7 @@ def parse_update(msg: dict, raw: str) -> Entry | None:
     if isinstance(ts, bool) or not isinstance(ts, (int, float)):
         return None
     return Entry(seg, rev, fin, float(ts), text, raw)
+
 
 async def handle_source(ws, hello: dict[str, Any]) -> None:
     session = hello.get("session")
@@ -179,96 +301,66 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
                     continue
                 result = store.apply(entry)
                 stats[result] += 1
-                print(f"  seg {entry.segment:>3} rev {entry.revision} "
-                      f"{'FINAL' if entry.final else 'draft'} -> {result}", flush=True)
                 if result == ACCEPTED:
                     if NAIVE:
-                        await broadcast_naively(raw)      # temporary, as before
+                        await broadcast_naively(raw)
                     else:
-                        await broadcast(entry.segment, raw)
-
+                        await broadcast(entry.segment, raw, entry.final)
             elif msg_type == "SOURCE_DONE":
-                # Test-control message. The specification does not require it
-                # to be forwarded to clients.
                 print("source finished", flush=True)
                 dump_store(stats)
             else:
-                # Forward compatibility: ignore fields/messages this baseline
-                # doesn't understand rather than crashing.
                 continue
     finally:
         print("source disconnected", flush=True)
 
 
-def dump_store(stats):
+def dump_store(stats) -> None:
     print("---- store summary ----")
     print("results     :", dict(stats))
     print("entries     :", len(store.entries))
     print("earliest    :", store.earliest, " latest:", store.latest)
     print("contig_final:", store.contig_final)
-    print("active      :", [e.segment for e in store.active()])
-    for s in store.order:
-        e = store.entries[s]
-        print(f"  seg {s:>3} rev {e.revision} {'FINAL' if e.final else 'draft'} ts={e.source_ts:.3f} {e.text[:40]!r}")
-        
-"""
-Handle client's connection to the server for the whole connection, including
-resuming connection state.
-"""        
+    print("batches     :", BATCHES, " finals in batches:", BATCHED_FINALS)
+
+
+# ---------------------------------------------------------------------------
+# Client side
+# ---------------------------------------------------------------------------
 async def handle_client(ws, hello: dict[str, Any]) -> None:
+    """V0 naive path."""
     client_id = hello.get("client_id")
-
-    # The baseline has no stored recovery state. Sending an empty HISTORY makes
-    # the connection behavior visible and keeps the starter easy to inspect.
-    # Students must implement correct HISTORY semantics for the assignment.
-
-    # naive: just keep sending latest segment
     await ws.send(json.dumps({"type": "HISTORY", "items": []}))
-
     CLIENTS.add(ws)
     print(f"client connected: id={client_id}; clients={len(CLIENTS)}", flush=True)
     try:
-        # Student clients normally don't send further messages after hello.
-        # Keep the WebSocket open until the client disconnects.
         async for _ in ws:
             pass
     finally:
         CLIENTS.discard(ws)
         print(f"client disconnected: id={client_id}; clients={len(CLIENTS)}", flush=True)
 
-"""
-Checks if a client has been connected before.
 
-If yes, it will send based on the information like the last segment and rev,
-and for how long does the client want to receive. (Whole segment is received)
-!!! Client should make sure to check its own buffer for how long does it store
-instead of keep on requesting.
-
-If no, it will add the client to the CLIENTS list and return the past 30 seconds
-worth of transcriptions.
-
-Vulnerability: Only validates client_id, vulnerable to spoofing
-TODO: deduplicate client_id
-"""
 async def handle_client_new(ws, hello: dict[str, Any]) -> None:
-    # format hello message
     client_id = hello.get("client_id")
-    session = hello.get("session") # not used
-    last_segment = int(hello.get("last_segment", 0))
-    last_revision = int(hello.get("last_revision", 0))
-    history_seconds = max(min(int(hello.get("history_seconds", 30)), 60), 0)
+    try:
+        last_segment = int(hello.get("last_segment", 0))
+        last_revision = int(hello.get("last_revision", 0))
+        history_seconds = max(min(int(hello.get("history_seconds", 30)), 60), 0)
+    except (TypeError, ValueError):
+        last_segment, last_revision, history_seconds = 0, 0, 30
 
     history = store.get_history(last_segment, last_revision, history_seconds)
-    raw = json.dumps({
-                        "type": "HISTORY",
-                        "items": [json.loads(e.raw) for e in history],
-                    })
-    
+    raw = json.dumps({"type": "HISTORY", "items": [json.loads(e.raw) for e in history]})
+
     client = Client(ws=ws, client_id=client_id)
-    client.enqueue(-1, raw)
+    # Cursor starts at the newest final the client will hold after this HISTORY.
+    newest = history[-1].segment if history else 0
+    client.last_final_sent = max(0, last_segment)
+    client.set_initial(raw, newest)
     CLIENTS.add(client)
     sender = asyncio.create_task(unicast(client))
-    
+
     if last_segment == 0 and last_revision == 0:
         print(f"client connected: id={client_id}; clients={len(CLIENTS)}", flush=True)
     else:
@@ -283,6 +375,7 @@ async def handle_client_new(ws, hello: dict[str, Any]) -> None:
         sender.cancel()
         CLIENTS.discard(client)
         print(f"client disconnected: id={client_id}; clients={len(CLIENTS)}", flush=True)
+
 
 async def handler(ws) -> None:
     try:
@@ -303,42 +396,38 @@ async def handler(ws) -> None:
     else:
         await ws.close(code=1008, reason="Expected SOURCE_HELLO or CLIENT_HELLO")
 
-def print_queue():
-  if len(CLIENTS) == 0:  return
-  queue_length_sum = 0
-  max_queue_length = 0
-  for c in CLIENTS:
-    queue_length_sum += len(c.order)
-    max_queue_length = max(max_queue_length, len(c.order))
-  print(
-      "[PROFILE_QUEUE_LENGTH]",
-      "average",
-      time.monotonic(),
-      queue_length_sum / len(CLIENTS),
-      "max",
-      max_queue_length
-  )
-  if LAG_WINDOW_DROP:
-    print("[PROFILE_LAG_DROPS]", time.monotonic(), LAG_DROPS)
+
+# ---------------------------------------------------------------------------
+# Monitoring / entry point
+# ---------------------------------------------------------------------------
+def print_queue() -> None:
+    if NAIVE or not CLIENTS:
+        return
+    lens = [len(c) for c in CLIENTS]
+    lagging = sum(1 for c in CLIENTS if c.lagging)
+    print("[PROFILE_QUEUE_LENGTH]", "average", time.monotonic(),
+          sum(lens) / len(lens), "max", max(lens), flush=True)
+    if LAG_WINDOW_DROP:
+        print("[PROFILE_LAG_DROPS]", time.monotonic(), LAG_DROPS, flush=True)
+    if BATCH_FINALS:
+        print("[PROFILE_BATCH]", time.monotonic(), "lagging", lagging,
+              "batches", BATCHES, "finals_batched", BATCHED_FINALS, flush=True)
 
 
-async def monitor_fn(interval: float = 1.0):
-  try:
-    while True:
-      print_queue()
-      await asyncio.sleep(interval)
-  except asyncio.CancelledError:
-    print("\nQueue monitor stopped.")
+async def monitor_fn(interval: float = 1.0) -> None:
+    try:
+        while True:
+            print_queue()
+            await asyncio.sleep(interval)
+    except asyncio.CancelledError:
+        print("\nQueue monitor stopped.")
+
 
 async def main_async(port: int) -> None:
     monitor_task = asyncio.create_task(monitor_fn(interval=1.0))
     async with websockets.serve(
-        handler,
-        "0.0.0.0",
-        port,
-        max_size=2**20,
-        ping_interval=20,
-        ping_timeout=20,
+        handler, "0.0.0.0", port,
+        max_size=2**20, ping_interval=20, ping_timeout=20,
     ):
         print(f"LiveRecall v{VERSION} listening on ws://0.0.0.0:{port}", flush=True)
         await asyncio.Future()
