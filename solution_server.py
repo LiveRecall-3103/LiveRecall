@@ -265,6 +265,8 @@ async def handle_client_new(ws, hello: dict[str, Any]) -> None:
     try:
         async for _ in ws:
             pass
+    except websockets.ConnectionClosed:
+        pass
     finally:
         sender.cancel()
         CLIENTS.discard(client)
