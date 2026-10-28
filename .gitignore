@@ -5,3 +5,7 @@ venv/
 results/
 *.log
 *.pdf
+
+*.csv
+*.json
+
