@@ -91,6 +91,8 @@ class Client:
         # Lag state
         self.rtt = 0.0
         self.lagging = False
+        
+        self.last_prov = (0, 0)     # (segment, revision) of the last provisional sent in lag mode
 
     # ---- queries ------------------------------------------------------------
     def __len__(self) -> int:
@@ -114,6 +116,10 @@ class Client:
     def enqueue(self, segment: int, raw: str, final: bool = False) -> bool:
         """Queue one revision. Returns False if the client must be cut off."""
         global LAG_DROPS
+        # Lag mode: the store is the source of truth. Just wake the sender.
+        if LOOKUP_WHEN_LAGGING and self.lagging:
+            self.ready.set()
+            return True
         slot = self.slots.get(segment)
 
         if slot is not None:
@@ -137,39 +143,47 @@ class Client:
         return True
 
     # ---- lag detection --------------------------------------------------------
-    def update_mode(self) -> None:
-        """Hysteresis: enter lag above LAG_ENTER, leave only when both signals are low."""
-        age = self.oldest_age()
+    def update_mode(self, store: CaptionStore) -> None:
         if not self.lagging:
-            if age > LAG_ENTER or self.rtt > LAG_ENTER:
+            if self.oldest_age() > LAG_ENTER or self.rtt > LAG_ENTER:
                 self.lagging = True
-        elif age < LAG_EXIT_AGE and self.rtt < LAG_EXIT_RTT:
-            self.lagging = False
+                if LOOKUP_WHEN_LAGGING:
+                    self._clear_queue()          # store will supply everything
+        else:
+            # Leave only when the client is responsive AND has nothing outstanding,
+            # otherwise the cleared queue would silently lose what it still lacks.
+            if self.rtt < LAG_EXIT_RTT and self._nothing_missing(store):
+                self.lagging = False
 
     # ---- consumer side: THE sending decision -----------------------------------
     def next_message(self, store: CaptionStore) -> str | None:
-        """Called each time the previous send (and pong) has completed."""
         global BATCHES, BATCHED_FINALS
 
-        # 1. Late-join / resume HISTORY always goes first, untouched.
         if self.initial is not None:
             raw, self.initial = self.initial, None
             return raw
 
-        # 2. Lagging and the client lacks 2+ finals -> one mass send.
-        if BATCH_FINALS:
-            self.update_mode()
-            if self.lagging:
-                missing = store.finals_after_segment(self.last_final_sent)
-                if len(missing) > 1:
-                    self.last_final_sent = missing[-1].segment
-                    self._purge_sent_finals()
-                    BATCHES += 1
-                    BATCHED_FINALS += len(missing)
-                    # each raw is already a valid JSON object: join, don't re-encode
-                    return '{"type":"HISTORY","items":[' + ",".join(e.raw for e in missing) + "]}"
+        if not BATCH_FINALS:
+            return self._pop_next()
 
-        # 3. Otherwise normal FIFO (every revision, in order).
+        self.update_mode(store)
+
+        if self.lagging and LOOKUP_WHEN_LAGGING:
+            missing = store.finals_after_segment(self.last_final_sent)
+            if len(missing) > 1:
+                self.last_final_sent = missing[-1].segment
+                BATCHES += 1
+                BATCHED_FINALS += len(missing)
+                return '{"type":"HISTORY","items":[' + ",".join(e.raw for e in missing) + "]}"
+            if missing:
+                self.last_final_sent = missing[0].segment
+                return missing[0].raw
+            prov = store.newest_active_after(self.last_final_sent)
+            if prov is not None and (prov.segment, prov.revision) != self.last_prov:
+                self.last_prov = (prov.segment, prov.revision)
+                return prov.raw               # looked up now, not stored earlier
+            return None                       # nothing new; sender sleeps until next enqueue
+
         return self._pop_next()
 
     # ---- internals --------------------------------------------------------------
@@ -207,6 +221,18 @@ class Client:
     def _maybe_compact(self) -> None:
         if len(self.order) > 2 * self.maxsize:
             self.order = deque(s for s in self.order if s.alive)
+            
+        def _clear_queue(self) -> None:
+        for s in self.slots.values():
+            s.alive = False
+        self.slots.clear()
+        self.order.clear()
+
+    def _nothing_missing(self, store: CaptionStore) -> bool:
+        if store.finals_after_segment(self.last_final_sent):
+            return False
+        prov = store.newest_active_after(self.last_final_sent)
+        return prov is None or (prov.segment, prov.revision) == self.last_prov
 
 
 CLIENTS: set[Any] = set()
