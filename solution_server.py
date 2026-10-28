@@ -48,6 +48,7 @@ class Client:
         self.pending: dict[int, str] = {}
 
     def enqueue(self, segment, raw) -> bool:
+        print(len(self.order))
         if segment in self.pending:
             self.pending[segment] = raw
         else:
@@ -119,6 +120,8 @@ async def unicast(client) -> None:
             while client.order:
                 msg = client.dequeue()
                 await client.ws.send(msg)
+                await (await client.ws.ping())
+
             client.ready.clear()
     except websockets.ConnectionClosed:
         pass
