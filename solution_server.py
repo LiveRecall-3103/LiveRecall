@@ -31,12 +31,17 @@ from dataclasses import dataclass
 from typing import Any
 from collections import Counter
 
+import time
 import websockets
 
 from config import VERSION
 
 NAIVE = VERSION == 0
 PING_FLOW_CONTROL = VERSION >= 2
+LAG_WINDOW_DROP = VERSION >= 3
+MAX_LAG_WINDOW = 10.00
+# Performance counter: clients disconnected by the lag-window check (V3)
+LAG_DROPS = 0
 
 # Updated clients class
 class Client:
@@ -51,21 +56,28 @@ class Client:
         self.pending: dict[int, str] = {}
 
     def enqueue(self, segment, raw) -> bool:
+        global LAG_DROPS
+        now = time.monotonic()
         if segment in self.pending:
-            self.pending[segment] = raw
+            first_ts, _ = self.pending[segment]
+            self.pending[segment] = (first_ts, raw)
         else:
             if len(self.order) == self.maxsize:
                 return False
-            else:
-                self.order.append(segment)
-                self.pending.update({segment:raw})
+            #### Update: if the oldest entry is too far behind, we force client to disconnect (MAX_LAG_WINDOW)
+            # Keep MAX_LAG_WINDOW + reconnect delay < history_seconds (30) so HISTORY can fill the gap
+            if LAG_WINDOW_DROP and self.order and now - self.pending[self.order[0]][0] > MAX_LAG_WINDOW:
+                LAG_DROPS += 1
+                return False
+            self.order.append(segment)
+            self.pending.update({segment:(now, raw)})
 
         self.ready.set()
         return True
 
     def dequeue(self) -> bool:
         segment = self.order.popleft()
-        msg = self.pending.pop(segment)
+        _, msg = self.pending.pop(segment)
         return msg
     
 CLIENTS: set[Any] | set[Client] = set()
@@ -291,8 +303,35 @@ async def handler(ws) -> None:
     else:
         await ws.close(code=1008, reason="Expected SOURCE_HELLO or CLIENT_HELLO")
 
+def print_queue():
+  if len(CLIENTS) == 0:  return
+  queue_length_sum = 0
+  max_queue_length = 0
+  for c in CLIENTS:
+    queue_length_sum += len(c.order)
+    max_queue_length = max(max_queue_length, len(c.order))
+  print(
+      "[PROFILE_QUEUE_LENGTH]",
+      "average",
+      time.monotonic(),
+      queue_length_sum / len(CLIENTS),
+      "max",
+      max_queue_length
+  )
+  if LAG_WINDOW_DROP:
+    print("[PROFILE_LAG_DROPS]", time.monotonic(), LAG_DROPS)
+
+
+async def monitor_fn(interval: float = 1.0):
+  try:
+    while True:
+      print_queue()
+      await asyncio.sleep(interval)
+  except asyncio.CancelledError:
+    print("\nQueue monitor stopped.")
 
 async def main_async(port: int) -> None:
+    monitor_task = asyncio.create_task(monitor_fn(interval=1.0))
     async with websockets.serve(
         handler,
         "0.0.0.0",
