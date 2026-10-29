@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 CS3103 Assignment 4 - LiveRecall server.
-
 Versions:
   0: Naive broadcast
   2: Per-client queue + ping flow control
@@ -9,7 +8,6 @@ Versions:
   4: + Batch missing finals into one HISTORY
   5: + Store lookup while lagging; no queue in lag mode
 """
-
 from __future__ import annotations
 
 import argparse
@@ -36,7 +34,6 @@ LAG_ENTER = 0.5
 LAG_EXIT_AGE = 0.3
 LAG_EXIT_RTT = 0.2
 
-# Experiment statistics
 LAG_DROPS = 0
 LAG_ENTRIES = 0
 BATCHES = 0
@@ -49,13 +46,13 @@ store = CaptionStore(keep_seconds=120.0, max_items=500)
 
 
 class Slot:
-    """One queued segment; provisional revisions replace the existing slot."""
+    """A queued segment whose provisional updates replace its current value."""
 
     __slots__ = ("seg", "first_ts", "raw", "final", "alive")
 
-    def __init__(self, seg: int, first_ts: float, raw: str, final: bool):
+    def __init__(self, seg: int, raw: str, final: bool):
         self.seg = seg
-        self.first_ts = first_ts
+        self.first_ts = time.monotonic()
         self.raw = raw
         self.final = final
         self.alive = True
@@ -68,16 +65,13 @@ class Client:
         self.maxsize = maxsize
         self.ready = asyncio.Event()
 
-        # Normal-mode queue
         self.initial: str | None = None
         self.slots: dict[int, Slot] = {}
         self.order: deque[Slot] = deque()
 
-        # Delivery cursors
         self.last_final_sent = 0
         self.last_prov = (0, 0)
 
-        # Flow control
         self.rtt = 0.0
         self.inflight_since: float | None = None
         self.lagging = False
@@ -105,7 +99,7 @@ class Client:
         self.slots.clear()
         self.order.clear()
 
-    def _maybe_compact(self) -> None:
+    def _compact_order(self) -> None:
         if len(self.order) > 2 * self.maxsize:
             self.order = deque(slot for slot in self.order if slot.alive)
 
@@ -121,11 +115,7 @@ class Client:
             return
 
         now = time.monotonic()
-        waiting = (
-            now - self.inflight_since
-            if self.inflight_since is not None
-            else 0.0
-        )
+        waiting = now - self.inflight_since if self.inflight_since is not None else 0.0
 
         if (
             self.oldest_age(now) > LAG_ENTER
@@ -142,7 +132,7 @@ class Client:
         self.ready.set()
 
     def enqueue(self, segment: int, raw: str, final: bool = False) -> bool:
-        """Queue an update, or absorb it while V5 is lagging."""
+        """Queue an update, or absorb it while using V5 lookup recovery."""
         global LAG_DROPS, LAG_ABSORBED
 
         if BATCH_FINALS:
@@ -164,21 +154,19 @@ class Client:
             if len(self.slots) >= self.maxsize:
                 return False
 
-            now = time.monotonic()
-            if LAG_WINDOW_DROP and self.oldest_age(now) > MAX_LAG_WINDOW:
+            if LAG_WINDOW_DROP and self.oldest_age() > MAX_LAG_WINDOW:
                 LAG_DROPS += 1
                 return False
 
-            slot = Slot(segment, now, raw, final)
+            slot = Slot(segment, raw, final)
             self.slots[segment] = slot
             self.order.append(slot)
-            self._maybe_compact()
+            self._compact_order()
 
         self.ready.set()
         return True
 
     def _pop_next(self) -> str | None:
-        """Pop the next live FIFO entry, skipping already-batched finals."""
         while True:
             self._trim_order()
             if not self.order:
@@ -194,20 +182,11 @@ class Client:
 
             return slot.raw
 
-    def _next_lagging_message(self, store: CaptionStore) -> str | None:
-        """Deliver missing finals and, in V5, the newest unseen provisional."""
+    def _next_lagging_message(self, caption_store: CaptionStore) -> str | None:
         global BATCHES, BATCHED_FINALS, PROV_SENT_LAG
 
-        missing = store.finals_after_segment(self.last_final_sent)
-        print(
-            "[LAG_RECOVERY]",
-            "client", self.client_id,
-            "cursor", self.last_final_sent,
-            "missing", len(missing),
-            "newest_final", store.newest_final_seg(),
-            "store_entries", len(store.entries),
-            flush=True,
-        )
+        missing = caption_store.finals_after_segment(self.last_final_sent)
+
         if len(missing) > 1:
             self.last_final_sent = missing[-1].segment
             self._purge_sent_finals()
@@ -217,10 +196,7 @@ class Client:
             return '{"type":"HISTORY","items":[' + items + "]}"
 
         if not LOOKUP_WHEN_LAGGING:
-            if (
-                self.oldest_age() < LAG_EXIT_AGE
-                and self.rtt < LAG_EXIT_RTT
-            ):
+            if self.oldest_age() < LAG_EXIT_AGE and self.rtt < LAG_EXIT_RTT:
                 self.lagging = False
             return self._pop_next()
 
@@ -228,23 +204,20 @@ class Client:
             self.last_final_sent = missing[0].segment
             return missing[0].raw
 
-        provisional = store.newest_active_after(self.last_final_sent)
-
-        if (
-            provisional is not None
-            and (provisional.segment, provisional.revision) != self.last_prov
-        ):
-            self.last_prov = (provisional.segment, provisional.revision)
-            PROV_SENT_LAG += 1
-            return provisional.raw
+        provisional = caption_store.newest_active_after(self.last_final_sent)
+        if provisional is not None:
+            key = (provisional.segment, provisional.revision)
+            if key != self.last_prov:
+                self.last_prov = key
+                PROV_SENT_LAG += 1
+                return provisional.raw
 
         if self.rtt < LAG_EXIT_RTT:
             self.lagging = False
 
         return None
 
-    def next_message(self, store: CaptionStore) -> str | None:
-        """Select the next message after the previous send and pong complete."""
+    def next_message(self, caption_store: CaptionStore) -> str | None:
         if self.initial is not None:
             raw, self.initial = self.initial, None
             return raw
@@ -253,32 +226,26 @@ class Client:
             return self._pop_next()
 
         self.maybe_enter_lag()
-
         if not self.lagging:
             return self._pop_next()
 
-        return self._next_lagging_message(store)
+        return self._next_lagging_message(caption_store)
 
 
-async def broadcast_naively(raw_message: str) -> None:
-    if not CLIENTS:
-        return
-
-    clients = list(CLIENTS)
+async def broadcast_naively(raw: str) -> None:
     results = await asyncio.gather(
-        *(client.send(raw_message) for client in clients),
+        *(client.send(raw) for client in list(CLIENTS)),
         return_exceptions=True,
     )
 
-    for client, result in zip(clients, results):
+    for client, result in zip(list(CLIENTS), results):
         if isinstance(result, Exception):
             CLIENTS.discard(client)
 
 
-async def broadcast(segment: int, raw_message: str, final: bool) -> None:
-    """Enqueue updates without yielding, preserving snapshot consistency."""
+async def broadcast(segment: int, raw: str, final: bool) -> None:
     for client in list(CLIENTS):
-        if not client.enqueue(segment, raw_message, final):
+        if not client.enqueue(segment, raw, final):
             CLIENTS.discard(client)
             asyncio.create_task(
                 client.ws.close(code=1013, reason="client too slow")
@@ -291,11 +258,7 @@ async def unicast(client: Client) -> None:
             await client.ready.wait()
             client.ready.clear()
 
-            while True:
-                message = client.next_message(store)
-                if message is None:
-                    break
-
+            while (message := client.next_message(store)) is not None:
                 started = time.monotonic()
                 client.inflight_since = started
 
@@ -313,11 +276,8 @@ async def unicast(client: Client) -> None:
 
 def parse_update(msg: dict, raw: str) -> Entry | None:
     try:
-        seg = msg["segment"]
-        rev = msg["revision"]
-        final = msg["final"]
-        ts = msg["source_ts"]
-        text = msg["text"]
+        seg, rev = msg["segment"], msg["revision"]
+        final, ts, text = msg["final"], msg["source_ts"], msg["text"]
     except KeyError:
         return None
 
@@ -347,26 +307,27 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
                 stats["not_object"] += 1
                 continue
 
-            msg_type = msg.get("type")
-
-            if msg_type == "CAPTION_UPDATE":
-                entry = parse_update(msg, raw)
-                if entry is None:
-                    stats["invalid"] += 1
-                    continue
-
-                result = store.apply(entry)
-                stats[result] += 1
-
-                if result == ACCEPTED:
-                    if NAIVE:
-                        await broadcast_naively(raw)
-                    else:
-                        await broadcast(entry.segment, raw, entry.final)
-
-            elif msg_type == "SOURCE_DONE":
+            if msg.get("type") == "SOURCE_DONE":
                 print("source finished", flush=True)
                 dump_store(stats)
+                continue
+
+            if msg.get("type") != "CAPTION_UPDATE":
+                continue
+
+            entry = parse_update(msg, raw)
+            if entry is None:
+                stats["invalid"] += 1
+                continue
+
+            result = store.apply(entry)
+            stats[result] += 1
+
+            if result == ACCEPTED:
+                if NAIVE:
+                    await broadcast_naively(raw)
+                else:
+                    await broadcast(entry.segment, raw, entry.final)
 
     finally:
         print("source disconnected", flush=True)
@@ -380,75 +341,47 @@ def dump_store(stats: Counter) -> None:
     print("contig_final :", store.contig_final)
     print("lag entries  :", LAG_ENTRIES, " lag drops:", LAG_DROPS)
     print("batches      :", BATCHES, " finals in batches:", BATCHED_FINALS)
-    print(
-        "lag absorbed :", LAG_ABSORBED,
-        " provisionals sent from lookup:", PROV_SENT_LAG,
-    )
+    print("lag absorbed :", LAG_ABSORBED, " provisionals sent:", PROV_SENT_LAG)
 
 
 async def handle_client(ws, hello: dict[str, Any]) -> None:
-    """V0 naive client handler."""
-    client_id = hello.get("client_id")
     await ws.send(json.dumps({"type": "HISTORY", "items": []}))
     CLIENTS.add(ws)
+    client_id = hello.get("client_id")
 
-    print(
-        f"client connected: id={client_id}; clients={len(CLIENTS)}",
-        flush=True,
-    )
+    print(f"client connected: id={client_id}; clients={len(CLIENTS)}", flush=True)
 
     try:
         async for _ in ws:
             pass
     finally:
         CLIENTS.discard(ws)
-        print(
-            f"client disconnected: id={client_id}; clients={len(CLIENTS)}",
-            flush=True,
-        )
+        print(f"client disconnected: id={client_id}; clients={len(CLIENTS)}", flush=True)
 
 
 async def handle_client_new(ws, hello: dict[str, Any]) -> None:
-    client_id = hello.get("client_id")
-
     try:
         last_segment = int(hello.get("last_segment", 0))
         last_revision = int(hello.get("last_revision", 0))
-        history_seconds = max(
-            0, min(int(hello.get("history_seconds", 30)), 60)
-        )
+        history_seconds = max(0, min(int(hello.get("history_seconds", 30)), 60))
     except (TypeError, ValueError):
         last_segment, last_revision, history_seconds = 0, 0, 30
 
-    # No await between snapshot creation and registration: live updates cannot
-    # slip between the history snapshot and registration.
-    history = store.get_history(
-        last_segment, last_revision, history_seconds
-    )
+    history = store.get_history(last_segment, last_revision, history_seconds)
     initial = json.dumps({
         "type": "HISTORY",
         "items": [json.loads(entry.raw) for entry in history],
     })
 
-    client = Client(ws, client_id)
-    client.last_final_sent = max(
-        max(0, last_segment),
-        store.newest_final_seg(),
-    )
+    client = Client(ws, hello.get("client_id"))
+    client.last_final_sent = max(max(0, last_segment), store.newest_final_seg())
     client.set_initial(initial)
 
     CLIENTS.add(client)
     sender = asyncio.create_task(unicast(client))
 
-    action = (
-        "connected"
-        if last_segment == 0 and last_revision == 0
-        else "reconnected"
-    )
-    print(
-        f"client {action}: id={client_id}; clients={len(CLIENTS)}",
-        flush=True,
-    )
+    action = "connected" if last_segment == 0 and last_revision == 0 else "reconnected"
+    print(f"client {action}: id={client.client_id}; clients={len(CLIENTS)}", flush=True)
 
     try:
         async for _ in ws:
@@ -458,34 +391,27 @@ async def handle_client_new(ws, hello: dict[str, Any]) -> None:
     finally:
         sender.cancel()
         CLIENTS.discard(client)
-        print(
-            f"client disconnected: id={client_id}; clients={len(CLIENTS)}",
-            flush=True,
-        )
+        print(f"client disconnected: id={client.client_id}; clients={len(CLIENTS)}", flush=True)
 
 
 async def handler(ws) -> None:
     try:
-        raw = await asyncio.wait_for(ws.recv(), timeout=5)
-        hello = json.loads(raw)
+        hello = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
     except (asyncio.TimeoutError, json.JSONDecodeError):
         await ws.close(code=1008, reason="Expected a valid hello message")
         return
 
-    msg_type = hello.get("type")
+    if not isinstance(hello, dict):
+        await ws.close(code=1008, reason="Expected a hello object")
+        return
 
+    msg_type = hello.get("type")
     if msg_type == "SOURCE_HELLO":
         await handle_source(ws, hello)
     elif msg_type == "CLIENT_HELLO":
-        if NAIVE:
-            await handle_client(ws, hello)
-        else:
-            await handle_client_new(ws, hello)
+        await (handle_client if NAIVE else handle_client_new)(ws, hello)
     else:
-        await ws.close(
-            code=1008,
-            reason="Expected SOURCE_HELLO or CLIENT_HELLO",
-        )
+        await ws.close(code=1008, reason="Expected SOURCE_HELLO or CLIENT_HELLO")
 
 
 def print_queue() -> None:
@@ -505,10 +431,9 @@ def print_queue() -> None:
         print("[PROFILE_LAG_DROPS]", now, LAG_DROPS, flush=True)
 
     if BATCH_FINALS:
-        lagging = sum(client.lagging for client in CLIENTS)
         print(
             "[PROFILE_BATCH]", now,
-            "lagging", lagging,
+            "lagging", sum(client.lagging for client in CLIENTS),
             "batches", BATCHES,
             "finals_batched", BATCHED_FINALS,
             "absorbed", LAG_ABSORBED,
@@ -523,24 +448,19 @@ async def monitor_fn(interval: float = 1.0) -> None:
             print_queue()
             await asyncio.sleep(interval)
     except asyncio.CancelledError:
-        print("\nQueue monitor stopped.")
+        pass
 
 
 async def main_async(port: int) -> None:
     asyncio.create_task(monitor_fn())
 
     async with websockets.serve(
-        handler,
-        "0.0.0.0",
-        port,
+        handler, "0.0.0.0", port,
         max_size=2**20,
         ping_interval=20,
         ping_timeout=20,
     ):
-        print(
-            f"LiveRecall v{VERSION} listening on ws://0.0.0.0:{port}",
-            flush=True,
-        )
+        print(f"LiveRecall v{VERSION} listening on ws://0.0.0.0:{port}", flush=True)
         await asyncio.Future()
 
 
