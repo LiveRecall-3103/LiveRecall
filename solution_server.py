@@ -29,9 +29,9 @@ LAG_WINDOW_DROP = VERSION >= 3
 BATCH_FINALS = VERSION >= 4              # opt 2
 
 MAX_LAG_WINDOW = 10.0   # s: oldest queued item older than this -> disconnect (V3)
-LAG_ENTER = 1.0         # s: queue age or pong RTT above this -> lagging
-LAG_EXIT_AGE = 0.3      # s: queue age must fall below this ...
-LAG_EXIT_RTT = 0.2      # s: ... and RTT below this -> back to normal
+LAG_ENTER = 0.4         # s: queue age or pong RTT above this -> lagging
+LAG_EXIT_AGE = 0.1      # s: queue age must fall below this ...
+LAG_EXIT_RTT = 0.1      # s: ... and RTT below this -> back to normal
 
 # Counters for the report
 LAG_DROPS = 0           # clients disconnected by the lag-window check (V3)
@@ -189,6 +189,9 @@ async def unicast(client: Client) -> None:
                 if PING_FLOW_CONTROL:
                     await (await client.ws.ping())
                 client.rtt = time.monotonic() - t0
+                if client.rtt > 0.5:
+                    print(f"[SLOW] id={client.client_id} rtt={client.rtt:.2f} "
+                        f"dirty={len(client.dirty)} lagging={client.lagging}", flush=True)
             # No await between the None above and this clear, so no wake-up is lost.
             client.ready.clear()
     except websockets.ConnectionClosed:
