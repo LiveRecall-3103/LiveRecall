@@ -43,17 +43,6 @@ BATCHED_FINALS = 0      # finals delivered inside mass sends (V4)
 # ---------------------------------------------------------------------------
 # Per-client state
 # ---------------------------------------------------------------------------
-class Slot:
-    """One queued segment (newest revision only), shared by `order` and `finals`."""
-    __slots__ = ("seg", "first_ts", "raw", "final", "alive")
-
-    def __init__(self, seg: int, first_ts: float, raw: str, final: bool):
-        self.seg = seg
-        self.first_ts = first_ts   # when the segment first entered the queue (never reset)
-        self.raw = raw             # newest revision's JSON
-        self.final = final
-        self.alive = True          # False = tombstone, skipped by the other deque
-
 
 class Client:
     def __init__(self, ws, client_id, maxsize: int = 100):
@@ -62,68 +51,47 @@ class Client:
         self.ready = asyncio.Event()
         self.maxsize = maxsize
 
-        self.initial: str | None = None        # late-join / resume HISTORY, outside the queue
-        self.slots: dict[int, Slot] = {}       # segment -> live slot (coalescing lookup)
-        self.order: deque[Slot] = deque()      # FIFO of all revisions (may hold tombstones)
-        self.finals: deque[Slot] = deque()     # finals only, oldest first (may hold tombstones)
-        self.n_final = 0                       # live finals: O(1) "2 or more?" check
+        self.initial: str | None = None       # late-join / resume HISTORY
+        self.dirty: dict[int, float] = {}     # segment -> first_dirty_ts, insertion-ordered
+        self.last_final_sent = 0              # cursor: highest final segment sent
 
-        self.rtt = 0.0                         # last send -> pong time
+        self.rtt = 0.0
         self.lagging = False
 
     # ---- queries ------------------------------------------------------------
     def __len__(self) -> int:
-        return len(self.slots) + (self.initial is not None)
+        return len(self.dirty) + (self.initial is not None)
 
     def oldest_age(self, now: float | None = None) -> float:
-        """Seconds the oldest live queued segment has been waiting (0 if empty)."""
-        self._trim_order()
-        if not self.order:
+        if not self.dirty:
             return 0.0
         if now is None:
             now = time.monotonic()
-        return now - self.order[0].first_ts
+        return now - next(iter(self.dirty.values()))
 
     # ---- producer side --------------------------------------------------------
-    def set_initial(self, raw: str) -> None:
+    def set_initial(self, raw: str, cursor: int) -> None:
         self.initial = raw
+        self.last_final_sent = max(self.last_final_sent, cursor)
         self.ready.set()
 
-    def enqueue(self, segment: int, raw: str, final: bool = False) -> bool:
-        """Queue one revision. Returns False if the client must be cut off."""
+    def enqueue(self, segment: int) -> bool:
+        """Mark a segment dirty. Content is read from the store at send time.
+        Returns False if the client must be cut off."""
         global LAG_DROPS
-        slot = self.slots.get(segment)
-
-        if slot is not None:
-            if slot.final:
-                return True                    # a final is never replaced
-            slot.raw = raw                     # coalesce: newest revision, keep original age
-            if final:                          # provisional upgraded to final in place
-                slot.final = True
-                self.finals.append(slot)
-                self.n_final += 1
-        else:
-            if len(self.slots) >= self.maxsize:
+        if segment not in self.dirty:             # already dirty = coalesced, keep age
+            if len(self.dirty) >= self.maxsize:
                 return False
             now = time.monotonic()
-            # Keep MAX_LAG_WINDOW + reconnect delay < history_seconds so HISTORY can fill the gap
             if LAG_WINDOW_DROP and self.oldest_age(now) > MAX_LAG_WINDOW:
                 LAG_DROPS += 1
                 return False
-            slot = Slot(segment, now, raw, final)
-            self.slots[segment] = slot
-            self.order.append(slot)
-            if final:
-                self.finals.append(slot)
-                self.n_final += 1
-            self._maybe_compact()
-
+            self.dirty[segment] = now
         self.ready.set()
         return True
 
     # ---- lag state --------------------------------------------------------------
     def update_mode(self) -> None:
-        """Hysteresis: enter above LAG_ENTER, leave only when both signals are low."""
         global LAG_ENTRIES
         age = self.oldest_age()
         if not self.lagging:
@@ -134,68 +102,47 @@ class Client:
             self.lagging = False
 
     # ---- consumer side: the sending decision --------------------------------------
-    def next_message(self) -> str | None:
-        """Called after the previous send (and its pong) completed.
-        Returns the next wire message, or None if the queue is empty."""
+    def next_message(self, store: CaptionStore) -> str | None:
         global BATCHES, BATCHED_FINALS
 
-        # 1. Late-join / resume HISTORY always goes first, untouched.
+        # 1. Late-join / resume HISTORY first.
         if self.initial is not None:
             raw, self.initial = self.initial, None
             return raw
 
-        # 2. Lagging with 2+ finals waiting -> one mass send, oldest first.
+        # 2. Lagging and the client lacks 2+ finals -> one mass send from the store.
         if BATCH_FINALS:
             self.update_mode()
-            if self.lagging and self.n_final > 1:
-                raws = self._pop_finals()
-                BATCHES += 1
-                BATCHED_FINALS += len(raws)
-                # each raw is already a valid JSON object: join, don't re-encode
-                return '{"type":"HISTORY","items":[' + ",".join(raws) + "]}"
+            if self.lagging and store.newest_final_seg() - self.last_final_sent >= 2:
+                missing = store.finals_after_segment(self.last_final_sent)
+                if len(missing) > 1:
+                    self.last_final_sent = missing[-1].segment
+                    self._drop_covered()
+                    BATCHES += 1
+                    BATCHED_FINALS += len(missing)
+                    return '{"type":"HISTORY","items":[' + ",".join(e.raw for e in missing) + "]}"
 
-        # 3. Otherwise normal FIFO: every revision, in order.
-        return self._pop_next()
+        # 3. Otherwise FIFO over dirty segments, content read from the store NOW.
+        while self.dirty:
+            seg = next(iter(self.dirty))
+            del self.dirty[seg]
+            e = store.entries.get(seg)
+            if e is None:                         # pruned from the store
+                continue
+            if seg <= self.last_final_sent:       # client already holds this segment's final
+                continue
+            if e.final:
+                self.last_final_sent = seg
+            return e.raw
+        return None
 
-    # ---- internals ------------------------------------------------------------------
-    def _pop_next(self) -> str | None:
-        self._trim_order()
-        if not self.order:
-            return None
-        slot = self.order.popleft()
-        self._kill(slot)
-        return slot.raw
-
-    def _pop_finals(self) -> list[str]:
-        """Remove every queued final. Touches only finals: O(k), not O(queue)."""
-        taken: list[Slot] = []
-        while self.finals:
-            slot = self.finals.popleft()
-            if slot.alive:                     # skip tombstones
-                self._kill(slot)
-                taken.append(slot)
-        taken.sort(key=lambda s: s.seg)        # already ordered in practice
-        return [s.raw for s in taken]
-
-    def _kill(self, slot: Slot) -> None:
-        """Remove from the live set; the deques keep a tombstone until reached."""
-        slot.alive = False
-        del self.slots[slot.seg]
-        if slot.final:
-            self.n_final -= 1
-
-    def _trim_order(self) -> None:
-        while self.order and not self.order[0].alive:
-            self.order.popleft()
-
-    def _maybe_compact(self) -> None:
-        """Bound tombstones so memory per client stays O(maxsize)."""
-        limit = 2 * self.maxsize
-        if len(self.order) > limit:
-            self.order = deque(s for s in self.order if s.alive)
-        if len(self.finals) > limit:
-            self.finals = deque(s for s in self.finals if s.alive)
-
+    def _drop_covered(self) -> None:
+        """After a batch, discard dirty segments the cursor now covers."""
+        while self.dirty:
+            seg = next(iter(self.dirty))
+            if seg > self.last_final_sent:
+                break
+            del self.dirty[seg]
 
 CLIENTS: set[Any] = set()
 
@@ -220,22 +167,21 @@ async def broadcast_naively(raw_message: str) -> None:
             CLIENTS.discard(client)
 
 
-async def broadcast(segment: int, raw_message: str, final: bool) -> None:
-    """Put the message into every client's queue. Never awaits."""
+async def broadcast(segment: int) -> None:
+    """Mark the segment dirty for every client. Never awaits."""
     if not CLIENTS:
         return
     for client in list(CLIENTS):
-        if not client.enqueue(segment, raw_message, final):
+        if not client.enqueue(segment):
             CLIENTS.discard(client)
             asyncio.create_task(client.ws.close(code=1013, reason="client too slow"))
-
 
 async def unicast(client: Client) -> None:
     try:
         while True:
             await client.ready.wait()
             while True:
-                msg = client.next_message()    # decision made here, after each pong
+                msg = client.next_message(store)    # decision made here, after each pong
                 if msg is None:
                     break
                 t0 = time.monotonic()
@@ -294,8 +240,7 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
                     if NAIVE:
                         await broadcast_naively(raw)
                     else:
-                        await broadcast(entry.segment, raw, entry.final)
-
+                        await broadcast(entry.segment)
             elif msg_type == "SOURCE_DONE":
                 print("source finished", flush=True)
                 dump_store(stats)
@@ -331,7 +276,6 @@ async def handle_client(ws, hello: dict[str, Any]) -> None:
         CLIENTS.discard(ws)
         print(f"client disconnected: id={client_id}; clients={len(CLIENTS)}", flush=True)
 
-
 async def handle_client_new(ws, hello: dict[str, Any]) -> None:
     client_id = hello.get("client_id")
     try:
@@ -345,7 +289,7 @@ async def handle_client_new(ws, hello: dict[str, Any]) -> None:
     raw = json.dumps({"type": "HISTORY", "items": [json.loads(e.raw) for e in history]})
 
     client = Client(ws=ws, client_id=client_id)
-    client.set_initial(raw)
+    client.set_initial(raw, max(last_segment, store.newest_final_seg()))
     CLIENTS.add(client)
     sender = asyncio.create_task(unicast(client))
 
@@ -364,7 +308,7 @@ async def handle_client_new(ws, hello: dict[str, Any]) -> None:
         CLIENTS.discard(client)
         print(f"client disconnected: id={client_id}; clients={len(CLIENTS)}", flush=True)
 
-
+        
 async def handler(ws) -> None:
     try:
         raw = await asyncio.wait_for(ws.recv(), timeout=5)
