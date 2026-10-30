@@ -25,6 +25,7 @@ class CaptionStore:
         self.order: deque[int] = deque()      # segment numbers, ascending
         self.latest_ts = 0.0                  # newest source_ts seen
         self.contig_final = 0                 # highest N where segments 1..N are all final
+        self.latest_final = 0                 # highest final segment seen (O(1) lookup)
 
     # ---- main entry point -------------------------------------------------
     def apply(self, new: Entry) -> str:
@@ -54,6 +55,8 @@ class CaptionStore:
 
         self.latest_ts = max(self.latest_ts, new.source_ts)
         if new.final:
+            if new.segment > self.latest_final:
+                self.latest_final = new.segment
             self._advance_contig()
         self._prune()
         return ACCEPTED
@@ -160,9 +163,18 @@ class CaptionStore:
                 return e
         return None
 
-    def newest_final_seg(self) -> int:
-        """Highest final segment currently held (0 if none)."""
+    def active_after(self, seg: int) -> list[Entry]:
+        """Non-final entries with segment > seg, oldest -> newest.
+        Walks back from the newest end and stops at the cursor: O(entries after seg)."""
+        out: list[Entry] = []
         for s in reversed(self.order):
-            if self.entries[s].final:
-                return s
-        return 0
+            if s <= seg:
+                break
+            e = self.entries[s]
+            if not e.final:
+                out.append(e)
+        out.reverse()
+        return out
+
+    def newest_final_seg(self) -> int:
+        return self.latest_final

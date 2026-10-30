@@ -29,21 +29,28 @@ LAG_WINDOW_DROP = VERSION >= 3
 BATCH_FINALS = VERSION >= 4              # opt 2
 
 MAX_LAG_WINDOW = 10.0   # s: oldest queued item older than this -> disconnect (V3)
-LAG_ENTER = 0.4         # s: queue age or pong RTT above this -> lagging
-LAG_EXIT_AGE = 0.1      # s: queue age must fall below this ...
-LAG_EXIT_RTT = 0.1      # s: ... and RTT below this -> back to normal
+LAG_ENTER = 0.4         # s: oldest queued age or pong RTT above this -> lagging
+LAG_EXIT_RTT = 0.15     # s: when nothing is left to send and RTT is below this -> normal
 
 # Counters for the report
 LAG_DROPS = 0           # clients disconnected by the lag-window check (V3)
 LAG_ENTRIES = 0         # times a client entered lag mode (V4)
 BATCHES = 0             # mass sends (V4)
 BATCHED_FINALS = 0      # finals delivered inside mass sends (V4)
+LOG_ID = None   # set to a client id taken from a [LAG-ENTER] line
 
+LAG_AGE_ENTER = 0.5     # s: producer-side safety net (sender stuck, dirty is ageing)
+STALL_RTT = 0.15        # s: a pong slower than this means the client's reader is paused
+CAL_STALLS = 3          # consecutive stalled pongs needed to confirm lag and measure iv
+SAFETY_MSGS = 2.0       # extra messages assumed in the client's queue
+DEPTH_FINAL = 1.0       # send finals when estimated unread messages <= this
+DEPTH_PROV = 0.2        # send provisionals only when the client is ~idle
+LAG_FAST_IV = 0.15      # s: lag mode may only end if the client is proven fast
+LAG_EXIT_RTT = 0.15     # s
 
 # ---------------------------------------------------------------------------
 # Per-client state
 # ---------------------------------------------------------------------------
-
 class Client:
     def __init__(self, ws, client_id, maxsize: int = 100):
         self.ws = ws
@@ -52,11 +59,25 @@ class Client:
         self.maxsize = maxsize
 
         self.initial: str | None = None       # late-join / resume HISTORY
-        self.dirty: dict[int, float] = {}     # segment -> first_dirty_ts, insertion-ordered
+        self.dirty: dict[int, float] = {}     # normal mode only: segment -> first_dirty_ts
         self.last_final_sent = 0              # cursor: highest final segment sent
+        self.sent_rev: dict[int, int] = {}    # provisional segment -> highest revision sent
 
+        # pong measurement
         self.rtt = 0.0
+        self.stalls: list[float] = []         # completion times of consecutive stalled pongs
+        self.slept = False                    # a deliberate wait preceded the current send
+
+        # model of the client's hidden receive queue
+        self.iv: float | None = None          # client read interval (s), measured
+        self.cap_est: float | None = None     # client queue size, measured
+        self.depth = 0.0                      # estimated unread messages right now
+        self.depth_ts = time.monotonic()
+        self.sent_total = 0                   # frames sent on this connection
+        self.t_first: float | None = None     # when the first frame was sent
+
         self.lagging = False
+        self.lag_since = 0.0
 
     # ---- queries ------------------------------------------------------------
     def __len__(self) -> int:
@@ -76,9 +97,14 @@ class Client:
         self.ready.set()
 
     def enqueue(self, segment: int) -> bool:
-        """Mark a segment dirty. Content is read from the store at send time.
-        Returns False if the client must be cut off."""
+        """Normal mode: mark the segment dirty. Lag mode: just wake the sender,
+        which reads everything it needs from the store. False = cut the client off."""
         global LAG_DROPS
+        if BATCH_FINALS:
+            self._maybe_enter_lag()
+        if self.lagging:
+            self.ready.set()
+            return True
         if segment not in self.dirty:             # already dirty = coalesced, keep age
             if len(self.dirty) >= self.maxsize:
                 return False
@@ -90,16 +116,82 @@ class Client:
         self.ready.set()
         return True
 
-    # ---- lag state --------------------------------------------------------------
-    def update_mode(self) -> None:
+    # ---- lag detection -----------------------------------------------------------
+    def _enter_lag(self, now: float) -> None:
         global LAG_ENTRIES
-        age = self.oldest_age()
+        self.lagging = True
+        LAG_ENTRIES += 1
+        self.lag_since = now
+        self.dirty.clear()                 # the store plus the cursor supply everything
+
+    def _maybe_enter_lag(self) -> None:
+        """Safety net: the sender is stuck so long that dirty is ageing."""
+        if not self.lagging and self.oldest_age() > LAG_AGE_ENTER:
+            self._enter_lag(time.monotonic())
+
+    # ---- queue model ---------------------------------------------------------------
+    def _decay(self, now: float) -> None:
+        if self.iv:
+            self.depth = max(0.0, self.depth - (now - self.depth_ts) / self.iv)
+        self.depth_ts = now
+
+    def _set_full(self, now: float) -> None:
+        """The client's queue is known to be full right now."""
+        self.depth = (self.cap_est or 0.0) + SAFETY_MSGS
+        self.depth_ts = now
+
+    def wait_time(self, now: float, target: float) -> float:
+        """Seconds until the estimated backlog falls to `target` messages."""
+        if not self.iv:
+            return 0.0                     # not calibrated yet: pace by the pong clock
+        self._decay(now)
+        return max(0.0, (self.depth - target) * self.iv)
+
+    def send_target(self, store: CaptionStore) -> float:
+        return DEPTH_FINAL if store.newest_final_seg() > self.last_final_sent else DEPTH_PROV
+
+    def on_sent(self, now: float) -> None:
+        if self.t_first is None:
+            self.t_first = now
+        self.sent_total += 1
+        if self.iv:
+            self._decay(now)
+            self.depth += 1.0
+
+    def on_pong(self, now: float, rtt: float) -> None:
+        stalled = rtt > STALL_RTT
+        if self.slept:                     # we waited first; completions are not back-to-back
+            self.slept = False
+            self.stalls.clear()
+            if stalled and self.lagging and self.cap_est:
+                # the model said "drained" but the queue was still full: it was too small
+                self.cap_est = max(self.cap_est * 1.25, self.cap_est + 2.0)
+                self._set_full(now)
+                print(f"[LAG-UNDERSHOT] id={self.client_id} rtt={rtt:.2f} "
+                      f"cap_est->{self.cap_est:.1f}", flush=True)
+            return
+        if not stalled:
+            self.stalls.clear()
+            return
+        self.stalls.append(now)
+        if len(self.stalls) > CAL_STALLS:
+            self.stalls.pop(0)
+        if len(self.stalls) >= CAL_STALLS:
+            self._calibrate(now)
+
+    def _calibrate(self, now: float) -> None:
+        s = self.stalls
+        iv = max(0.05, (s[-1] - s[0]) / (len(s) - 1))   # exactly one read per completion
+        self.iv = iv if self.iv is None else 0.5 * self.iv + 0.5 * iv
+        if self.cap_est is None:
+            reads = 1.0 + (now - (self.t_first or now)) / self.iv
+            self.cap_est = max(2.0, self.sent_total - reads)
         if not self.lagging:
-            if age > LAG_ENTER or self.rtt > LAG_ENTER:
-                self.lagging = True
-                LAG_ENTRIES += 1
-        elif age < LAG_EXIT_AGE and self.rtt < LAG_EXIT_RTT:
-            self.lagging = False
+            self._enter_lag(now)
+        self._set_full(now)
+        self.stalls.clear()
+        print(f"[LAG-CAL] id={self.client_id} t={now - (self.t_first or now):.1f} "
+              f"iv={self.iv:.2f} sent={self.sent_total} cap_est={self.cap_est:.1f}", flush=True)
 
     # ---- consumer side: the sending decision --------------------------------------
     def next_message(self, store: CaptionStore) -> str | None:
@@ -110,19 +202,39 @@ class Client:
             raw, self.initial = self.initial, None
             return raw
 
-        # 2. Lagging and the client lacks 2+ finals -> one mass send from the store.
-        if BATCH_FINALS:
-            self.update_mode()
-            if self.lagging and store.newest_final_seg() - self.last_final_sent >= 2:
-                missing = store.finals_after_segment(self.last_final_sent)
-                if len(missing) > 1:
-                    self.last_final_sent = missing[-1].segment
-                    self._drop_covered()
-                    BATCHES += 1
-                    BATCHED_FINALS += len(missing)
-                    return '{"type":"HISTORY","items":[' + ",".join(e.raw for e in missing) + "]}"
+        # 2. Normal mode: every revision, in order.
+        if not BATCH_FINALS:
+            return self._next_fifo(store)
+        self._maybe_enter_lag()
+        if not self.lagging:
+            return self._next_fifo(store)
 
-        # 3. Otherwise FIFO over dirty segments, content read from the store NOW.
+        # 3. Lag mode, priority 1: every final the client lacks, in ONE message.
+        missing = store.finals_after_segment(self.last_final_sent)
+        if missing:
+            self.last_final_sent = missing[-1].segment
+            self._forget_covered_revs()
+            if len(missing) == 1:
+                return missing[0].raw
+            BATCHES += 1
+            BATCHED_FINALS += len(missing)
+            return '{"type":"HISTORY","items":[' + ",".join(e.raw for e in missing) + "]}"
+
+        # 4. Lag mode, priority 2: oldest active segment with a revision the client lacks.
+        for e in store.active_after(self.last_final_sent):
+            if e.revision > self.sent_rev.get(e.segment, 0):
+                self.sent_rev[e.segment] = e.revision
+                return e.raw
+
+        # 5. Caught up. Leave lag mode only if the client is proven fast.
+        if (self.rtt < LAG_EXIT_RTT and (self.iv is None or self.iv < LAG_FAST_IV)
+                and time.monotonic() - self.lag_since > 2.0):
+            self.lagging = False
+            self.stalls.clear()
+        return None
+
+    # ---- internals ----------------------------------------------------------------
+    def _next_fifo(self, store: CaptionStore) -> str | None:
         while self.dirty:
             seg = next(iter(self.dirty))
             del self.dirty[seg]
@@ -133,16 +245,15 @@ class Client:
                 continue
             if e.final:
                 self.last_final_sent = seg
+                self.sent_rev.pop(seg, None)
+            else:
+                self.sent_rev[seg] = e.revision
             return e.raw
         return None
 
-    def _drop_covered(self) -> None:
-        """After a batch, discard dirty segments the cursor now covers."""
-        while self.dirty:
-            seg = next(iter(self.dirty))
-            if seg > self.last_final_sent:
-                break
-            del self.dirty[seg]
+    def _forget_covered_revs(self) -> None:
+        for s in [s for s in self.sent_rev if s <= self.last_final_sent]:
+            del self.sent_rev[s]
 
 CLIENTS: set[Any] = set()
 
@@ -181,21 +292,32 @@ async def unicast(client: Client) -> None:
         while True:
             await client.ready.wait()
             while True:
-                msg = client.next_message(store)    # decision made here, after each pong
+                # Pace: in lag mode wait until the client's estimated backlog is small.
+                # Re-check every 100 ms so a final that arrives mid-wait is not held back.
+                while client.lagging and client.iv:
+                    w = client.wait_time(time.monotonic(), client.send_target(store))
+                    if w <= 0:
+                        break
+                    client.slept = True
+                    await asyncio.sleep(min(w, 0.1))
+                msg = client.next_message(store)     # chosen AFTER the wait
                 if msg is None:
                     break
                 t0 = time.monotonic()
                 await client.ws.send(msg)
+                client.on_sent(t0)
                 if PING_FLOW_CONTROL:
                     await (await client.ws.ping())
-                client.rtt = time.monotonic() - t0
-                if client.rtt > 0.5:
-                    print(f"[SLOW] id={client.client_id} rtt={client.rtt:.2f} "
-                        f"dirty={len(client.dirty)} lagging={client.lagging}", flush=True)
+                now = time.monotonic()
+                client.rtt = now - t0
+                client.on_pong(now, client.rtt)
             # No await between the None above and this clear, so no wake-up is lost.
             client.ready.clear()
     except websockets.ConnectionClosed:
         pass
+    except Exception as e:                           # never die silently
+        print(f"[SENDER-CRASH] id={client.client_id} {type(e).__name__}: {e}", flush=True)
+        raise
 
 
 # ---------------------------------------------------------------------------
