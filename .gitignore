@@ -5,6 +5,7 @@ venv/
 results/
 *.log
 *.pdf
+!docs/report.pdf
 *.csv
 *.json
 analytics/figures/
