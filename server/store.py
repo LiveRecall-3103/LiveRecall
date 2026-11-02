@@ -25,6 +25,7 @@ class CaptionStore:
         self.order: deque[int] = deque()      # segment numbers, ascending
         self.latest_ts = 0.0                  # newest source_ts seen
         self.contig_final = 0                 # highest N where segments 1..N are all final
+        self.latest_final = 0                 # highest final segment seen (O(1) lookup)
 
     # ---- main entry point -------------------------------------------------
     def apply(self, new: Entry) -> str:
@@ -54,6 +55,8 @@ class CaptionStore:
 
         self.latest_ts = max(self.latest_ts, new.source_ts)
         if new.final:
+            if new.segment > self.latest_final:
+                self.latest_final = new.segment
             self._advance_contig()
         self._prune()
         return ACCEPTED
@@ -135,3 +138,43 @@ class CaptionStore:
             out.append(e)
         out.reverse()                              # oldest -> newest, as the spec requires
         return out
+    
+    def finals_after_segment(self, seg: int) -> list[Entry]:
+        """All finals held with segment > seg, oldest -> newest.
+        `order` is ascending, so walk from the newest end and stop at the first
+        segment the client already has. Cost is O(finals returned)."""
+        out: list[Entry] = []
+        for s in reversed(self.order):
+            if s <= seg:
+                break
+            e = self.entries[s]
+            if e.final:
+                out.append(e)
+        out.reverse()
+        return out
+
+    def newest_active_after(self, seg: int) -> Entry | None:
+        """Newest non-final entry with segment > seg, else None."""
+        for s in reversed(self.order):
+            if s <= seg:
+                break
+            e = self.entries[s]
+            if not e.final:
+                return e
+        return None
+
+    def active_after(self, seg: int) -> list[Entry]:
+        """Non-final entries with segment > seg, oldest -> newest.
+        Walks back from the newest end and stops at the cursor: O(entries after seg)."""
+        out: list[Entry] = []
+        for s in reversed(self.order):
+            if s <= seg:
+                break
+            e = self.entries[s]
+            if not e.final:
+                out.append(e)
+        out.reverse()
+        return out
+
+    def newest_final_seg(self) -> int:
+        return self.latest_final
