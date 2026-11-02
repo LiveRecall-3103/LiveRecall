@@ -1,4 +1,4 @@
-"""Minimal LiveRecall ASR source: fixed audio chunks in, final captions out."""
+"""Minimal LiveRecall ASR source: audio chunks in, final and draft captions out."""
 import json
 import subprocess
 import time
@@ -14,9 +14,11 @@ import websockets
 SERVER_URL = "ws://127.0.0.1:8765"
 SESSION = "L1"
 SAMPLE_RATE = 16000
-CHUNK_SEC = 5
+CHUNK_SEC = 1
 CHUNK_BYTES = CHUNK_SEC * SAMPLE_RATE * 2  # each sample is 2 bytes
-MAX_QUEUE_CHUNKS = 6  # at most 30 s of waiting audio
+SEGMENT_TIMING_SEC = 5      # Each segment is 5 seconds
+FIRST_REVISION_SEC = 2      # Wait for 2s for audio to stabalize before parsing it to ASR model
+MAX_QUEUE_CHUNKS = 30        # at most 30 * 1 = 30 s of waiting audio
 
 # Microphone. To use a video file instead: ["-re", "-i", "lecture.mp4"]
 AUDIO_INPUT = ["-f", "pulse", "-i", "RDPSource"]   # Microphone input
@@ -45,7 +47,7 @@ def read_audio(ffmpeg):
             break
         if audio_queue.qsize() >= MAX_QUEUE_CHUNKS:
             audio_queue.get_nowait()  # drop the oldest chunk
-            print("Dropped 5 s of audio", flush=True)
+            print("Dropped {CHUNK_SEC}s of audio", flush=True)
         audio_queue.put((time.time(), raw_audio))
 
 async def send_message(ws, message, source_ts):
@@ -54,7 +56,7 @@ async def send_message(ws, message, source_ts):
     await ws.send(json.dumps(message))
 
 async def main():
-    model = SpeechToTextModel("small.en", 4)
+    model = SpeechToTextModel("base.en", 4)
 
     async with websockets.connect(SERVER_URL, max_size=2**20) as ws:
         await send_message(ws, {"type": "SOURCE_HELLO"}, time.time())
@@ -68,7 +70,11 @@ async def main():
         threading.Thread(target=read_audio, args=(ffmpeg,), daemon=True).start()
         asyncio.get_running_loop().add_signal_handler(signal.SIGINT, ffmpeg.terminate)
 
-        segment_number = 1
+        segment_number = 1      # Which segment number is this
+        revision = 0            # Last revision sent for this segment, 0 if none sent yet
+        audio_buffer = b""      # To concatenate the audio chunks
+        seconds = 0             
+        last_text = ""          
         try:
             while True:
 
@@ -78,31 +84,55 @@ async def main():
                     break
                 chunk_time, raw_audio = item
 
-                # Parse it to ASR to transcribe
-                audio = np.frombuffer(raw_audio, dtype=np.int16).astype(np.float32) / 32768
-                text = await asyncio.to_thread(model.transcribe, audio)
-                if not text:
+                audio_buffer = audio_buffer + raw_audio     # Append the audio to this buffer
+                seconds = seconds + CHUNK_SEC
+                if seconds < FIRST_REVISION_SEC:           
                     continue
 
+                # Pass it to ASR to transcribe
+                audio = np.frombuffer(audio_buffer, dtype=np.int16).astype(np.float32) / 32768
+                text = await asyncio.to_thread(model.transcribe, audio)
+                if text:
+                    last_text = text
+
+                final = seconds >= SEGMENT_TIMING_SEC
+
                 # Sends the caption update to server
-                # TODO Have revision numbers
-                await send_message(ws, {
-                    "type": "CAPTION_UPDATE",
-                    "segment": segment_number,
-                    "revision": 1,
-                    "final": True,
-                    "text": text,
-                }, chunk_time)
+                if last_text:
+                    revision = revision + 1
+                    await send_message(ws, {
+                        "type": "CAPTION_UPDATE",
+                        "segment": segment_number,
+                        "revision": revision,
+                        "final": final,
+                        "text": last_text,
+                    }, chunk_time)
+                    print(f"#{segment_number} rev {revision} {'FINAL' if final else 'draft'} {last_text}", flush=True)
 
-                print(f"#{segment_number} {text}", flush=True)
-
-                # Increment segment number
-                segment_number = segment_number + 1
+                # Start the next segment, reset all of the variables except segment number
+                if final:
+                    if last_text:
+                        segment_number = segment_number + 1
+                    revision = 0
+                    audio_buffer = b""
+                    seconds = 0
+                    last_text = ""
 
         finally:
             # Close the input
             ffmpeg.terminate()
             ffmpeg.wait()
+
+        # Stopped partway through a segment, so send the final revision
+        if revision > 0:
+            await send_message(ws, {
+                "type": "CAPTION_UPDATE",
+                "segment": segment_number,
+                "revision": revision + 1,
+                "final": True,
+                "text": last_text,
+            }, chunk_time)
+            segment_number = segment_number + 1
 
         print("Stopping")
         await send_message(ws, {"type": "SOURCE_DONE", "segments": segment_number - 1}, time.time())
