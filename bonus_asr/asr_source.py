@@ -47,7 +47,7 @@ def read_audio(ffmpeg):
             break
         if audio_queue.qsize() >= MAX_QUEUE_CHUNKS:
             audio_queue.get_nowait()  # drop the oldest chunk
-            print("Dropped {CHUNK_SEC}s of audio", flush=True)
+            print(f"Dropped {CHUNK_SEC}s of audio", flush=True)
         audio_queue.put((time.time(), raw_audio))
 
 async def send_message(ws, message, source_ts):
