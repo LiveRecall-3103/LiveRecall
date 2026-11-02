@@ -1,0 +1,4 @@
+# ASR bonus only. Keep separate from the mandatory requirements.txt.
+faster-whisper==1.2.1
+websockets>=13,<17
+numpy
