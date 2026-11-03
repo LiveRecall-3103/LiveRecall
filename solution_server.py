@@ -96,6 +96,13 @@ class Client:
     def final_backlog(self, store: CaptionStore) -> bool:
         return store.newest_final_seg() > self.last_final_sent
 
+    def final_pending(self, store: CaptionStore) -> bool:
+        """The next message would be a final."""
+        if self.lagging:
+            return self.final_backlog(store)
+        return any(s > self.last_final_sent and (e := store.entries.get(s)) is not None and e.final
+                   for s in self.dirty)
+
     # ---- producer side --------------------------------------------------------
     def set_initial(self, raw: str, cursor: int) -> None:
         self.initial = raw
@@ -206,7 +213,9 @@ class Client:
             self.soft_pongs = 0
             self.lag_exit_at = now
             LAG_EXITS += 1
-            for e in store.active_after(self.last_final_sent):
+            pending = (store.finals_after_segment(self.last_final_sent)
+                       + store.active_after(self.last_final_sent))
+            for e in sorted(pending, key=lambda e: e.segment):
                 self.dirty[e.segment] = now
             return self._next_fifo(store)
 
@@ -230,7 +239,12 @@ class Client:
 
     # ---- internals ----------------------------------------------------------------
     def _next_fifo(self, store: CaptionStore) -> str | None:
-        """Normal mode: every revision, in order; content read from the store NOW."""
+        """Normal mode: every revision, in order; content read from the store NOW.
+        A dirty final goes first (lowest segment, so the cursor never skips one)."""
+        finals = [s for s in self.dirty
+                  if s > self.last_final_sent and (e := store.entries.get(s)) is not None and e.final]
+        if finals:
+            self.dirty = {min(finals): 0.0, **self.dirty}  # key moves to the front, age kept
         while self.dirty:
             seg = next(iter(self.dirty))
             del self.dirty[seg]
@@ -314,11 +328,23 @@ async def unicast(client: Client) -> None:
                 
                 timed_out = False
                 pong = await client.ws.ping()
-                try:
-                    await asyncio.wait_for(asyncio.shield(pong), timeout=PONG_WAIT)
-                except asyncio.TimeoutError:
-                    timed_out = True                     # never block the sender on a pong
-                    pong.add_done_callback(_quiet)
+                deadline = t0 + PONG_WAIT
+                # A final that arrives while the pong is outstanding goes out at once;
+                # provisionals still wait for the pong (it is the lag signal).
+                while not pong.done():
+                    if client.final_pending(store) and (extra := client.next_message(store)) is not None:
+                        await client.ws.send(extra)
+                        continue
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        timed_out = True             # never block the sender on a pong
+                        pong.add_done_callback(_quiet)
+                        break
+                    client.ready.clear()
+                    woken = asyncio.ensure_future(client.ready.wait())
+                    await asyncio.wait({pong, woken}, timeout=remaining,
+                                       return_when=asyncio.FIRST_COMPLETED)
+                    woken.cancel()
                 now = time.monotonic()
                 client.on_pong(now, now - t0, timed_out)
             client.ready.clear()
@@ -461,6 +487,7 @@ def print_queue() -> None:
           sum(lens) / len(lens), "max", max(lens), flush=True)
     print("[PROFILE_LAG_DROPS]", now, LAG_DROPS, flush=True)
     lagging = sum(1 for c in CLIENTS if c.lagging)
+    global SHARED_LAG
     SHARED_LAG = lagging > SHARED_LAG_FRAC * len(CLIENTS)
     if SHARED_LAG:                                # sticky for each client's current lag episode
         for c in CLIENTS:
