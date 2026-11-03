@@ -143,7 +143,7 @@ class Client:
         elif rtt > LAG_PONG_SOFT:
             self.fast_pongs = 0
             self.soft_pongs += 1
-            if self.soft_pongs >= 1:
+            if self.soft_pongs >= 2:
                 self._enter_lag(now, rtt)
         else:
             self.soft_pongs = 0
