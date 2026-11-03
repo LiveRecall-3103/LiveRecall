@@ -2,11 +2,9 @@
 """
 CS3103 Assignment 4 - LiveRecall server.
 
-Versions (config.VERSION):
-  0  naive broadcast
-  2  per-client queue + ping flow control
-  3  + lag-window disconnect
-  4  + lag mode: finals first and unpaced, newest provisional only when idle
+v6: per-client queue + ping flow control + lag-window disconnect + lag mode
+(finals first and unpaced, newest provisional only when idle) + drain-estimate
+lag exit + event-driven pacing.
 """
 
 from __future__ import annotations
@@ -20,16 +18,7 @@ from typing import Any
 
 import websockets
 
-from config import VERSION
 from server.store import CaptionStore, Entry, ACCEPTED
-
-NAIVE = VERSION == 0
-PING_FLOW_CONTROL = VERSION >= 2
-LAG_WINDOW_DROP = VERSION >= 3
-LAG_MODE = VERSION >= 4
-SMART_LAG = VERSION >= 5            # earlier detection + drain-estimate exit
-SMART_PACING = VERSION >= 6
-
 
 MAX_LAG_WINDOW = 10.0    # s: normal-mode dirty age that disconnects (V3)
 
@@ -37,7 +26,8 @@ MAX_LAG_WINDOW = 10.0    # s: normal-mode dirty age that disconnects (V3)
 LAG_AGE_ENTER = 0.5      # s: sender stuck, dirty queue ageing -> lagging
 PONG_WAIT = 1.0          # s: the sender never blocks on a pong longer than this
 LAG_PONG_HARD = 1.0      # s: one pong this slow (or a timeout) -> lagging
-LAG_PONG_SOFT = 0.2 if SMART_LAG else 0.3
+LAG_PONG_SOFT = 0.2
+PING_EVERY_N = 4
 
 # ---- lag behaviour ----
 LAG_PROV_GAP = 4.0       # s: while lagging, a provisional only after this long with no send
@@ -100,8 +90,7 @@ class Client:
         """Normal mode: mark the segment dirty (content is read from the store at
         send time). Lag mode: just wake the sender. False = cut the client off."""
         global LAG_DROPS
-        if LAG_MODE:
-            self._maybe_enter_lag()
+        self._maybe_enter_lag()
         if self.lagging:
             self.ready.set()
             return True
@@ -109,7 +98,7 @@ class Client:
             if len(self.dirty) >= self.maxsize:
                 return False
             now = time.monotonic()
-            if LAG_WINDOW_DROP and self.oldest_age(now) > MAX_LAG_WINDOW:
+            if self.oldest_age(now) > MAX_LAG_WINDOW:
                 LAG_DROPS += 1
                 return False
             self.dirty[segment] = now
@@ -154,8 +143,6 @@ class Client:
     def _caught_up(self, now: float) -> bool:
         if self.fast_pongs < LAG_CALM_PONGS:
             return False
-        if not SMART_LAG:                       # V4: simple exit after a short calm
-            return now - self.lag_since > 3.0
         reads = (now - self.lag_since) / self.iv_est
         return reads - self.lag_sent >= LAG_QUEUE_GUESS + LAG_EXIT_MARGIN
 
@@ -169,8 +156,6 @@ class Client:
             return raw
 
         # Normal sending
-        if not LAG_MODE:
-            return self._next_fifo(store)
         self._maybe_enter_lag()
         if not self.lagging:
             return self._next_fifo(store)
@@ -236,20 +221,6 @@ store = CaptionStore(keep_seconds=120.0, max_items=500)
 # ---------------------------------------------------------------------------
 # Distribution
 # ---------------------------------------------------------------------------
-async def broadcast_naively(raw_message: str) -> None:
-    """V0: send directly to every client, waiting for all sends."""
-    if not CLIENTS:
-        return
-    snapshot = list(CLIENTS)
-    results = await asyncio.gather(
-        *(client.send(raw_message) for client in snapshot),
-        return_exceptions=True,
-    )
-    for client, result in zip(snapshot, results):
-        if isinstance(result, Exception):
-            CLIENTS.discard(client)
-
-
 async def broadcast(segment: int) -> None:
     """Mark the segment dirty for every client. Never awaits."""
     if not CLIENTS:
@@ -268,48 +239,40 @@ def _quiet(fut) -> None:
 
 async def unicast(client: Client) -> None:
     last_send = 0.0
+    pkt_ctr = 0
     try:
         while True:
             await client.ready.wait()
             while True:
-                # Lagging client enters waiting phase
-                # Instead of running it 
-                if SMART_PACING:
-                    while client.lagging and not client.final_backlog(store):
-                        wait = last_send + LAG_PROV_GAP - time.monotonic()
-                        if wait <= 0:
-                            break
-    
-                        client.ready.clear()
-                        try:
-                            # wait for an update to be enqueue() before sending out the next caption, or wait expires
-                            # This is to check if that segment is a final or not
-                            await asyncio.wait_for(client.ready.wait(), timeout=wait)
-                        except asyncio.TimeoutError:
-                            break
-                else:
-                    # Lag mode: provisionals are rationed, finals never wait. The sleep is
-                    # sliced so a final that arrives mid-wait is sent within 0.1 s.
-                    if client.lagging and not client.final_backlog(store):
-                        wait = last_send + LAG_PROV_GAP - time.monotonic()
-                        while wait > 0 and not client.final_backlog(store):
-                            await asyncio.sleep(min(wait, 0.1))
-                            wait = last_send + LAG_PROV_GAP - time.monotonic()
-            
+                # Lag mode: provisionals are rationed, finals never wait. Sleep until
+                # the gap expires or enqueue() wakes us (a final may have arrived).
+                while client.lagging and not client.final_backlog(store):
+                    wait = last_send + LAG_PROV_GAP - time.monotonic()
+                    if wait <= 0:
+                        break
+                    client.ready.clear()
+                    try:
+                        await asyncio.wait_for(client.ready.wait(), timeout=wait)
+                    except asyncio.TimeoutError:
+                        break
+
                 msg = client.next_message(store)         # chosen AFTER the wait
                 if msg is None:
                     break
                 t0 = time.monotonic()
                 await client.ws.send(msg)
                 last_send = t0
+                pkt_ctr += 1
+                if client.lagging and pkt_ctr % PING_EVERY_N != 0:
+                    continue
+                
                 timed_out = False
-                if PING_FLOW_CONTROL:
-                    pong = await client.ws.ping()
-                    try:
-                        await asyncio.wait_for(asyncio.shield(pong), timeout=PONG_WAIT)
-                    except asyncio.TimeoutError:
-                        timed_out = True                 # never block the sender on a pong
-                        pong.add_done_callback(_quiet)
+                pong = await client.ws.ping()
+                try:
+                    await asyncio.wait_for(asyncio.shield(pong), timeout=PONG_WAIT)
+                except asyncio.TimeoutError:
+                    timed_out = True                     # never block the sender on a pong
+                    pong.add_done_callback(_quiet)
                 now = time.monotonic()
                 client.on_pong(now, now - t0, timed_out)
             client.ready.clear()
@@ -362,10 +325,7 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
                 result = store.apply(entry)
                 stats[result] += 1
                 if result == ACCEPTED:
-                    if NAIVE:
-                        await broadcast_naively(raw)
-                    else:
-                        await broadcast(entry.segment)
+                    await broadcast(entry.segment)
             elif msg_type == "SOURCE_DONE":
                 # Test-control only: the server does not depend on it.
                 print("source finished", flush=True)
@@ -392,20 +352,6 @@ def dump_store(stats) -> None:
 # Client side
 # ---------------------------------------------------------------------------
 async def handle_client(ws, hello: dict[str, Any]) -> None:
-    """V0 naive path."""
-    client_id = hello.get("client_id")
-    await ws.send(json.dumps({"type": "HISTORY", "items": []}))
-    CLIENTS.add(ws)
-    print(f"client connected: id={client_id}; clients={len(CLIENTS)}", flush=True)
-    try:
-        async for _ in ws:
-            pass
-    finally:
-        CLIENTS.discard(ws)
-        print(f"client disconnected: id={client_id}; clients={len(CLIENTS)}", flush=True)
-
-
-async def handle_client_new(ws, hello: dict[str, Any]) -> None:
     client_id = hello.get("client_id")
     try:
         last_segment = int(hello.get("last_segment", 0))
@@ -452,10 +398,7 @@ async def handler(ws) -> None:
     if msg_type == "SOURCE_HELLO":
         await handle_source(ws, hello)
     elif msg_type == "CLIENT_HELLO":
-        if NAIVE:
-            await handle_client(ws, hello)
-        else:
-            await handle_client_new(ws, hello)
+        await handle_client(ws, hello)
     else:
         await ws.close(code=1008, reason="Expected SOURCE_HELLO or CLIENT_HELLO")
 
@@ -464,18 +407,16 @@ async def handler(ws) -> None:
 # Monitoring / entry point
 # ---------------------------------------------------------------------------
 def print_queue() -> None:
-    if NAIVE or not CLIENTS:
+    if not CLIENTS:
         return
     lens = [len(c) for c in CLIENTS]
     now = time.monotonic()
     print("[PROFILE_QUEUE_LENGTH]", "average", now,
           sum(lens) / len(lens), "max", max(lens), flush=True)
-    if LAG_WINDOW_DROP:
-        print("[PROFILE_LAG_DROPS]", now, LAG_DROPS, flush=True)
-    if LAG_MODE:
-        lagging = sum(1 for c in CLIENTS if c.lagging)
-        print("[PROFILE_LAG]", now, "lagging", lagging, "entries", LAG_ENTRIES,
-              "exits", LAG_EXITS, flush=True)
+    print("[PROFILE_LAG_DROPS]", now, LAG_DROPS, flush=True)
+    lagging = sum(1 for c in CLIENTS if c.lagging)
+    print("[PROFILE_LAG]", now, "lagging", lagging, "entries", LAG_ENTRIES,
+          "exits", LAG_EXITS, flush=True)
 
 
 async def monitor_fn(interval: float = 1.0) -> None:
@@ -493,7 +434,7 @@ async def main_async(port: int) -> None:
         handler, "0.0.0.0", port,
         max_size=2**20, ping_interval=20, ping_timeout=20,
     ):
-        print(f"LiveRecall v{VERSION} listening on ws://0.0.0.0:{port}", flush=True)
+        print(f"LiveRecall v6 listening on ws://0.0.0.0:{port}", flush=True)
         await asyncio.Future()
 
 

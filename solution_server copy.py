@@ -28,6 +28,7 @@ PING_FLOW_CONTROL = VERSION >= 2
 LAG_WINDOW_DROP = VERSION >= 3
 LAG_MODE = VERSION >= 4
 SMART_LAG = VERSION >= 5            # earlier detection + drain-estimate exit
+SMART_PACING = VERSION >= 6
 
 
 MAX_LAG_WINDOW = 10.0    # s: normal-mode dirty age that disconnects (V3)
@@ -66,7 +67,6 @@ class Client:
         self.last_final_sent = 0              # cursor: highest final segment sent
         self.sent_rev: dict[int, int] = {}    # provisional segment -> highest revision sent
 
-        self.min_rtt = float('inf')
         self.rtt = 0.0
         self.soft_pongs = 0
         self.fast_pongs = 0
@@ -272,14 +272,30 @@ async def unicast(client: Client) -> None:
         while True:
             await client.ready.wait()
             while True:
-                # Lag mode: provisionals are rationed, finals never wait. The sleep is
-                # sliced so a final that arrives mid-wait is sent within 0.1 s.
-                if client.lagging and not client.final_backlog(store):
-                    wait = last_send + LAG_PROV_GAP - time.monotonic()
-                    while wait > 0 and not client.final_backlog(store):
-                        await asyncio.sleep(min(wait, 0.1))
+                # Lagging client enters waiting phase
+                # Instead of running it 
+                if SMART_PACING:
+                    while client.lagging and not client.final_backlog(store):
                         wait = last_send + LAG_PROV_GAP - time.monotonic()
-
+                        if wait <= 0:
+                            break
+    
+                        client.ready.clear()
+                        try:
+                            # wait for an update to be enqueue() before sending out the next caption, or wait expires
+                            # This is to check if that segment is a final or not
+                            await asyncio.wait_for(client.ready.wait(), timeout=wait)
+                        except asyncio.TimeoutError:
+                            break
+                else:
+                    # Lag mode: provisionals are rationed, finals never wait. The sleep is
+                    # sliced so a final that arrives mid-wait is sent within 0.1 s.
+                    if client.lagging and not client.final_backlog(store):
+                        wait = last_send + LAG_PROV_GAP - time.monotonic()
+                        while wait > 0 and not client.final_backlog(store):
+                            await asyncio.sleep(min(wait, 0.1))
+                            wait = last_send + LAG_PROV_GAP - time.monotonic()
+            
                 msg = client.next_message(store)         # chosen AFTER the wait
                 if msg is None:
                     break
