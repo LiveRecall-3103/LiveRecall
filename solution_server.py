@@ -35,6 +35,11 @@ LAG_CALM_PONGS = 3       # fast pongs in a row needed before the exit estimate i
 LAG_QUEUE_GUESS = 32     # assumed size of the client library's receive queue (conservative)
 LAG_EXIT_MARGIN = 4.0    # extra messages of drain required before leaving lag mode
 IV_CAP = 2.0             # s: upper bound on the estimated client read interval
+SHARED_LAG_FRAC = 0.5    # more than this share of clients lagging = the network, not the readers
+LAG_CALM = 3.0           # s of calm pongs that end a shared-cause lag (doubles per relapse)
+LAG_CALM_MAX = 48.0
+LAG_RELAPSE = 20.0       # s: re-entering lag mode this soon after an exit counts as a relapse
+SHARED_LAG = False       # set once a second by the monitor
 
 # Counters for the report
 LAG_DROPS = 0
@@ -66,6 +71,13 @@ class Client:
         self.lag_since = 0.0
         self.lag_sent = 0                     # messages sent since entering lag mode
         self.iv_est = 0.5                     # estimated client read interval (s)
+
+        # A lag that overlapped a shared bottleneck ends after calm pongs, not on
+        # the read-interval estimate (which a network queue inflates).
+        self.shared_cause = False
+        self.calm_since: float | None = None  # first fast pong of the current calm run
+        self.calm_need = LAG_CALM
+        self.lag_exit_at = -1e9
 
     # ---- queries ------------------------------------------------------------
     def __len__(self) -> int:
@@ -113,6 +125,10 @@ class Client:
             return
         self.lagging = True
         LAG_ENTRIES += 1
+        relapse = now - self.lag_exit_at < LAG_RELAPSE
+        self.calm_need = min(self.calm_need * 2, LAG_CALM_MAX) if relapse else LAG_CALM
+        self.shared_cause = SHARED_LAG
+        self.calm_since = None
         self.lag_since = now
         self.lag_sent = 0
         self.fast_pongs = 0
@@ -137,6 +153,10 @@ class Client:
             # While the client's queue is full, a pong returns about one read interval
             # after the previous one. Keep the max: over-estimating is the safe direction.
             self.iv_est = min(max(self.iv_est, rtt), IV_CAP)
+        if timed_out or rtt > LAG_PONG_SOFT:
+            self.calm_since = None
+        elif self.calm_since is None:
+            self.calm_since = now
         if timed_out or rtt > LAG_PONG_HARD:
             self.fast_pongs = 0
             self._enter_lag(now, rtt)
@@ -152,6 +172,8 @@ class Client:
     def _caught_up(self, now: float) -> bool:
         if self.fast_pongs < LAG_CALM_PONGS:
             return False
+        if self.shared_cause:
+            return self.calm_since is not None and now - self.calm_since >= self.calm_need
         reads = (now - self.lag_since) / self.iv_est
         return reads - self.lag_sent >= LAG_QUEUE_GUESS + LAG_EXIT_MARGIN
 
@@ -176,6 +198,7 @@ class Client:
         if self._caught_up(now):
             self.lagging = False
             self.soft_pongs = 0
+            self.lag_exit_at = now
             LAG_EXITS += 1
             for e in store.active_after(self.last_final_sent):
                 self.dirty[e.segment] = now
@@ -432,8 +455,13 @@ def print_queue() -> None:
           sum(lens) / len(lens), "max", max(lens), flush=True)
     print("[PROFILE_LAG_DROPS]", now, LAG_DROPS, flush=True)
     lagging = sum(1 for c in CLIENTS if c.lagging)
+    SHARED_LAG = lagging > SHARED_LAG_FRAC * len(CLIENTS)
+    if SHARED_LAG:                                # sticky for each client's current lag episode
+        for c in CLIENTS:
+            if c.lagging:
+                c.shared_cause = True
     print("[PROFILE_LAG]", now, "lagging", lagging, "entries", LAG_ENTRIES,
-          "exits", LAG_EXITS, flush=True)
+          "exits", LAG_EXITS, "shared", SHARED_LAG, flush=True)
 
 
 async def monitor_fn(interval: float = 1.0) -> None:
