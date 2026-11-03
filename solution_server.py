@@ -39,6 +39,7 @@ SHARED_LAG_FRAC = 0.5    # more than this share of clients lagging = the network
 LAG_CALM = 3.0           # s of calm pongs that end a shared-cause lag (doubles per relapse)
 LAG_CALM_MAX = 48.0
 LAG_RELAPSE = 20.0       # s: re-entering lag mode this soon after an exit counts as a relapse
+SHARED_RELAPSES = 2      # relapses after which a client's lag is its own (a slow reader)
 SHARED_LAG = False       # set once a second by the monitor
 
 # Counters for the report
@@ -71,6 +72,8 @@ class Client:
         self.lag_since = 0.0
         self.lag_sent = 0                     # messages sent since entering lag mode
         self.iv_est = 0.5                     # estimated client read interval (s)
+        self.relapses = 0                     # relapses in a row
+        self.own_lag = False                  # relapsed too often; never treated as shared
 
         # A lag that overlapped a shared bottleneck ends after calm pongs, not on
         # the read-interval estimate (which a network queue inflates).
@@ -127,7 +130,10 @@ class Client:
         LAG_ENTRIES += 1
         relapse = now - self.lag_exit_at < LAG_RELAPSE
         self.calm_need = min(self.calm_need * 2, LAG_CALM_MAX) if relapse else LAG_CALM
-        self.shared_cause = SHARED_LAG
+        self.relapses = self.relapses + 1 if relapse else 0
+        if self.relapses >= SHARED_RELAPSES:
+            self.own_lag = True
+        self.shared_cause = SHARED_LAG and not self.own_lag
         self.calm_since = None
         self.lag_since = now
         self.lag_sent = 0
@@ -458,7 +464,7 @@ def print_queue() -> None:
     SHARED_LAG = lagging > SHARED_LAG_FRAC * len(CLIENTS)
     if SHARED_LAG:                                # sticky for each client's current lag episode
         for c in CLIENTS:
-            if c.lagging:
+            if c.lagging and not c.own_lag:
                 c.shared_cause = True
     print("[PROFILE_LAG]", now, "lagging", lagging, "entries", LAG_ENTRIES,
           "exits", LAG_EXITS, "shared", SHARED_LAG, flush=True)
