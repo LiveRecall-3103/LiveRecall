@@ -58,6 +58,7 @@ class Client:
         self.sent_rev: dict[int, int] = {}    # provisional segment -> highest revision sent
 
         self.rtt = 0.0
+        self.base_rtt = float("inf")          # lowest pong delay seen (idle ping at connect)
         self.soft_pongs = 0
         self.fast_pongs = 0
 
@@ -119,10 +120,18 @@ class Client:
         self.dirty.clear()                        # store + cursor supply everything
 
     def _maybe_enter_lag(self) -> None:
-        if not self.lagging and self.oldest_age() > LAG_AGE_ENTER:
+        limit = LAG_AGE_ENTER
+        if self.base_rtt < float("inf"):
+            limit += min(self.base_rtt, 1.0) 
+        if not self.lagging and self.oldest_age() > limit:
             self._enter_lag(time.monotonic(), self.rtt)
 
     def on_pong(self, now: float, rtt: float, timed_out: bool) -> None:
+        # judge only the delay above the idle RTT
+        if not timed_out: 
+            self.base_rtt = min(self.base_rtt, rtt)
+        if self.base_rtt < float("inf"):
+            rtt = max(rtt - self.base_rtt, 0.0)
         self.rtt = rtt
         if self.lagging and (timed_out or rtt > LAG_PONG_SOFT):
             # While the client's queue is full, a pong returns about one read interval
@@ -243,6 +252,12 @@ async def unicast(client: Client) -> None:
     last_send = 0.0
     pkt_ctr = 0
     try:
+        t0 = time.monotonic()
+        try:
+            await asyncio.wait_for(await client.ws.ping(), timeout=PONG_WAIT)
+            client.base_rtt = time.monotonic() - t0     # Update idle RTT, before any captions are queued.
+        except asyncio.TimeoutError:
+            pass
         while True:
             await client.ready.wait()
             while True:
