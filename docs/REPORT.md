@@ -91,3 +91,53 @@ The browser client opens a WebSocket, sends `CLIENT_HELLO`, and renders every `C
 \appendix
 
 # Raw data
+
+# ASR Bonus: Real-Lecture Caption Source
+
+## Integration
+
+The ASR path is a third, optional component: `bonus_asr/asr_source.py` replaces `caption_source.py` as the caption source. It connects to the same `solution_server.py` over WebSocket, sends `SOURCE_HELLO`, then `CAPTION_UPDATE` messages, and finally `SOURCE_DONE`. **Neither `solution_server.py` nor the browser client was modified**; the server cannot tell the ASR source from the deterministic source, so every mechanism described in the main report (revision semantics, history, backpressure, lag mode, recovery) applies unchanged to ASR captions.
+
+### Pipeline
+
+1) `ffmpeg` (lecture audio / mic (default), 16 kHz mono s16le) 
+2) reader thread (1 s chunks, bounded queue (of size 30 chunks)) 
+3) faster-whisper `base.en` (CPU, int8, 4 threads, VAD filter) 
+4) `CAPTION_UPDATE` 
+5) `solution_server.py` 
+6) browser client.
+
+| Protocol field | How the ASR source sets it |
+|---|---|
+| `segment` | One segment per fixed 5 s window of audio (`SEGMENT_TIMING_SEC = 5`); incremented only if the window produced text, so silent windows do not create empty segments. |
+| `revision` | Each new 1 s chunk re-transcribes the whole window buffered so far and sends the result as the next revision. The first revision waits for 2 s of audio (`FIRST_REVISION_SEC = 2`), giving up to 3 provisional revisions and 1 final per segment. |
+| `final` | `true` once the window reaches 5 s, and for the partial window flushed on shutdown. |
+| `text` | The full transcript of the window, not a delta, so the client's replace-by-revision rule shows the newest hypothesis even when Whisper rewrites earlier words. |
+| `source_ts` | Wall-clock time at which the newest audio chunk was read. |
+
+### How to run it
+
+Installing the required dependencies:
+
+    sudo apt install ffmpeg
+    python3 -m venv asr-venv 
+    asr-venv/bin/pip install -r bonus_asr/requirements-asr.txt
+
+Running it (from the repository root, one terminal each and in the same order):
+
+    venv/bin/python solution_server.py --port 8765
+    python3 -m http.server 8000 -d client
+    asr-venv/bin/python bonus_asr/asr_source.py
+  
+  - Note the first run will download the `base.en` model (Around 150 MB)
+
+
+## Limitations
+
+- **Fixed-time segmentation.** Windows end every 5 s regardless of speech, so sentences and occasionally words are split across segments, and each window is transcribed without the previous one as context, which lowers accuracy at boundaries. Pause-based segmentation (using the VAD) would align segments with sentences.
+- **Re-transcription cost.** Each revision re-transcribes the whole window (2–5 s of audio), so the work per window grows with each revision. If the transcription timing exceeds the 1 s chunk interval, audio queues up.
+- **Overload drops audio to bound delay.** The audio queue is bounded at 30 chunks (30 s). When transcription falls behind, the oldest queued chunk is dropped and logged, so caption delay is capped at roughly 30 s instead of growing without limit, at the cost of permanently lost words. The dropped chunk can also leave a gap inside a window.
+- **No source reconnect or session reset.** Segment numbers restart at 1 on every run, while the server rejects updates for segments it already holds as final (DUP_FINAL) and an open browser ignores revisions lower than the ones it already shows, so the server must be restarted and the browser reloaded before each ASR run. The ASR source also does not reconnect if the server connection drops; it must be started again.
+- **Clock assumption.** `source_ts` uses the source machine's clock, and the client's recall window compares it with the browser's clock. This holds when both run on the same machine.
+- **Accuracy not tuned.** `base.en` on CPU was chosen for real-time speed. Accuracy and model size are not graded and were not optimised.
+    
