@@ -1,6 +1,6 @@
-# LiveRecall Public Test Results
+# LiveRecall Public Test Results: v5 vs v6 vs v7
 
-All 24 tests were run 3 times each (`run_demo.py --runs 3`, server restarted per run). The per-test tables list every v4 and v5 run (3 rows per version per test). The findings and the "P95 vs baseline" ratios use the median of the 3 runs. Raw per-run summaries are in `tN_run0X.json` / `.csv`.
+All 24 tests were run 3 times each per version (`run_demo.py --runs 3`, server restarted per run). Raw per-run summaries are in `tests/test_results/v5/`, `v6/` and `v7/` (`tN_run0X.json` / `.csv`). Findings and the summary table use the median of the 3 runs; the per-test tables list every run. Latencies are in ms.
 
 ## Test matrix
 
@@ -15,245 +15,332 @@ Each network profile runs the same four public scenarios (T1–T4) via `run_publ
 | loss_3pct | netem loss 3% | t17 | t18 | t19 | t20 |
 | reorder | netem delay 20ms, reorder 20% 50% | t21 | t22 | t23 | t24 |
 
+## Versions
+
+- **v5**: per-client queue, ping flow control, lag-window disconnect and lag mode (finals first, newest provisional only when idle). A lagging client polls for new captions every 0.1 s.
+- **v6**: same as v5, but a lagging client waits on `client.ready` and wakes the moment a caption arrives, instead of polling.
+- **v7** (`solution_server.py`):
+  - Lag is judged by `rtt - min_rtt` (extra delay above the client's best RTT), not raw RTT. Before, a 100 ms link alone pushed every pong over the 0.2 s soft limit.
+  - 2 soft-slow pongs in a row are needed before a client counts as lagging (`LAG_SOFT_IN_ROW`).
+  - The queue-age trigger allows for the link RTT (`LAG_AGE_ENTER + min(min_rtt, 1 s)`).
+  - Up to 4 pings in flight per normal client (`PING_WINDOW`) instead of waiting for each pong.
+
 ## Key findings
 
-- **Correctness held in 71 of 72 runs.** 0 duplicates, 0 stale finals and 0 connection errors in every run. Final completeness is 100% everywhere except one run: t16 run 2 (delay_loss, T4) reached 99.34% (7,550 of 7,600 finals) in v4. The median is still 100%, and v5 reached 100% in all 72 runs.
-- **Under latency or loss, only finals get through.** Each caption has 3 revisions, so an update coverage of 33.3% means only the final revision was delivered. That is what happens under delay_100ms (all tests), delay_loss (all tests) and bandwidth_2mbit at 100 clients (T2–T4). loss_3pct sits at 42–59%. Coverage stays at baseline (100%, or 94–98% in T3/T4) under no impairment and under reorder.
-- **Skipping intermediates keeps finals fresh.** Fresh-final stays at ~98–100% under delay_100ms and bandwidth_2mbit, and is 85–93% under delay_loss.
-- **delay_loss is still the worst profile.** P95 is 530–760 ms (79–310× baseline), fresh 85–93%, and reconnect recovery is ~250 ms (P50) / ~350 ms (P95).
-- **Fixed delay shifts latency.** delay_100ms adds ~240–250 ms to P50 and reorder (20 ms) adds ~40 ms. That is roughly twice the netem value, because a caption crosses `lo` twice (source → server → client).
-- **Loss mostly hits the tail.** loss_3pct leaves T1 P50 at baseline (1.2 ms), but P95 rises to ~90–210 ms (TCP retransmission timeout), and P50 rises to 20–34 ms at 100 clients.
-- **Bandwidth matters only at scale.** At 20 clients 2 mbit is close to baseline (P95 3.4 ms). At 100 clients P95 rises to ~106–110 ms.
-- **Slow readers (T3).** With no impairment and under reorder, normal clients stay at 100% fresh with baseline P95 (4.8 ms / 44.6 ms), while slow clients sit at ~2.3 s P50 / ~7.8 s P95 age and 35% fresh. The 94.3% fresh-final and coverage in those two rows come from the slow clients. Under bandwidth_2mbit, delay_100ms and delay_loss only finals are sent, so slow clients keep up and look the same as normal ones (92–100% fresh). Under loss_3pct, slow clients fall behind (P95 6.5 s, 62% fresh) while normal clients stay at 100% fresh.
-- **Reconnect (T4)** recovery time follows the link latency: ≈2 ms baseline, 4 ms 2 mbit, 40 ms reorder, 200 ms delay_100ms, 250 ms delay_loss. Under loss_3pct it is 0.5 ms.
+**Correctness**
+- 0 duplicates, 0 stale and 0 connection errors in all 216 runs.
+- Final completeness is 100% in every run except three: v5 t16 run 2 (99.34%), v7 t15 run 2 (99.93%, 7,595 of 7,600 finals) and v7 t16 run 3 (99.99%). Every median is 100%.
 
-## Changes since the previous results
+**v5 → v6 (no more polling)**
+- bandwidth_2mbit, 100 clients (t6–t8): ~3× faster. P50 38–63 → 14–21 ms, P95 106–110 → 38–43 ms.
+- delay_100ms (t9–t12): ~47 ms faster at P50 and ~70 ms at P95, matching the ~50 ms average the 0.1 s polling added.
+- loss_3pct (t17–t20): P50 back near baseline (20–34 → 3–4 ms at 100 clients). P95 drops from ~91–96 → 3–8 ms in t17, t18 and t20.
+- delay_loss (t13–t16): P50 ~50 ms faster and fresh-final mostly up (84.8 → 91.6% in t13, 81.0 → 86.9% in t16). The tail is mixed: t15 P95 533 → 687 ms, t16 recovery P95 339 → 584 ms.
 
-- delay_loss improved a lot: P95 ~1,000 ms → 530–760 ms, fresh-final ~18–31% → 85–93%, reconnect recovery P50 ~21 s → ~250 ms.
-- Update coverage fell from ~96–100% to 33–59% under bandwidth_2mbit (100 clients), delay_100ms, delay_loss and loss_3pct (intermediate revisions are now skipped).
-- loss_3pct P95 got worse: ~2–10 ms → ~90–210 ms.
-- bandwidth_2mbit at 100 clients got worse: P95 ~42 ms → ~106–110 ms. Reconnect recovery improved: ~49 ms → ~4 ms.
-- T3 baseline slow clients improved: P50 age ~4.2 s → ~2.3 s, fresh 5.9% → 35%, overall fresh-final 90.8% → 94.3%.
+**v6 → v7 (lag detection uses RTT above the minimum)**
+- Normal clients now get every update on impaired links. In v5/v6, coverage was ~33% (finals only) under bandwidth_2mbit (100 clients), delay_100ms and delay_loss, and 42–59% under loss_3pct, because every client was wrongly marked as lagging. In v7 it is 92–100%, except delay_loss (79–94%) and t19 (91.7%).
+- Latency for normal clients stays at v6 levels despite ~3× more messages: bandwidth_2mbit P95 ~40–43 ms, delay_100ms P95 ~245–250 ms.
+- delay_loss is fresher: t13 fresh 91.6 → 94.5% and P95 665 → 525 ms; t16 fresh 89.1 → 94.7%, P95 719 → 509 ms, recovery P95 584 → 341 ms. Fresh-*final* dropped slightly in t14 (91.9 → 88.0%) and t15 (89.0 → 85.8%).
+- loss_3pct tail improved: t19 P95 217 → 9.5 ms, t20 P99 214 → 10 ms.
+- **Slow clients (T3) are now ~8 s behind on every network.** Slow-client P95 is 8.2–8.8 s and slow fresh is 28–33% in all six T3 tests. In v5/v6 that only happened in t3 and t23 (~7.8 s, 35%). This pushes overall P99 in t7, t11 and t15 from under 0.9 s to 6.1–7.1 s.
+- No impairment (t1–t4) and reorder (t21–t24): no meaningful change in any version (within ~1–3 ms).
 
-## v4 vs v5 (lag-mode wait change)
+**Why slow clients fall behind in v7**
+- v7 still has lag-mode skipping: finals first, then only the newest provisional, at most one every 4 s (`LAG_PROV_GAP`). In v5/v6 the false lag alarm happened to put slow clients into this mode right away under delay and bandwidth limits, which is why they looked fine there.
+- Lag mode starts too late. The client library answers pings on its own, so pongs only slow down once its receive buffer is full (~32 messages, `LAG_QUEUE_GUESS`). At 500 ms per read that is ~16 s of backlog, already sent and impossible to recall.
+- The message counts fit this: each slow client got ~100 messages in v7 (76 finals + ~25 provisionals, most sent before lag mode started), against 76 (finals only) in v5/v6 under delay and bandwidth limits.
+- Possible fix: detect lag before the client's buffer fills, for example by counting sent messages that have no pong back yet, instead of waiting for pongs to slow down.
 
-v4 = `tests/test_results/v4/`, v5 = `tests/test_results/v5/`. Same 24 tests, 3 runs each, same network profiles. Values are medians of the 3 runs (final completeness shows the worst run, since every median is 100%); latencies in ms.
+**Network effects (v7)**
+- Fixed delay shifts latency by about twice the netem value, because a caption crosses `lo` twice (source → server → client): delay_100ms P50 ~200 ms, reorder (20 ms) P50 ~42 ms.
+- Loss mostly hits the tail: loss_3pct P50 stays at 2–4 ms, but P99 reaches ~210 ms in t17/t18 (TCP retransmission timeout).
+- delay_loss is still the worst profile: P95 509–820 ms and fresh 90–95%.
 
-The only server change is in `unicast()`: a lagging client used to poll for new captions every 0.1 s, and now it waits on `client.ready` and wakes the moment a caption arrives. Clients are marked lagging when their RTT is high, so the change only matters on impaired links.
+## Summary (median of 3 runs, v5 → v6 → v7)
 
-- **Correctness unchanged or better.** v5 has 0 duplicates, 0 stale and 0 connection errors in all 72 runs, and 100% final completeness in every run (v4 t16 run 2 had 99.34%).
-- **bandwidth_2mbit, 100 clients (t6–t8): ~3× faster.** P50 ~38–63 → 14–21 ms, P95 ~106–110 → 38–43 ms.
-- **delay_100ms (t9–t12): ~47 ms faster at P50, ~70 ms at P95.** That matches the 0–100 ms (≈50 ms average) the old 0.1 s polling added.
-- **delay_loss (t13–t16): P50 ~50 ms faster and fresh-final mostly up** (84.8 → 91.6% in t13, 81.0 → 86.9% in t16). The tail is mixed: t15 P95 got worse (533 → 687 ms) and t16 reconnect recovery P95 went from 339 → 584 ms (v5 runs vary 373–907 ms).
-- **loss_3pct (t17–t20): P50 back near baseline** (20–34 → 3–4 ms at 100 clients), and P95 drops from ~91–96 → 3–8 ms in t17, t18 and t20. T3 slow-client P95 (~6.5 s) is unchanged.
-- **No impairment (t1–t4) and reorder (t21–t24): no change.** Differences are within run-to-run noise, as expected, since no client is marked lagging there.
-
-| Test | Scenario | Network | P50 v4 → v5 | P95 v4 → v5 | P99 v4 → v5 | Fresh-final % v4 → v5 | Final complete % (worst run) v4 → v5 | Coverage % v4 → v5 | Extra (v4 → v5) |
-|---|---|---|---|---|---|---|---|---|---|
-| t1 | T1 | None | 1.5 → 1.3 (-11%) | 2.4 → 2.0 (-18%) | 2.9 → 2.2 (-23%) | 100.0 → 100.0 | 100.00 → 100.00 | 100.0 → 100.0 |  |
-| t2 | T2 | None | 3.6 → 3.5 (-4%) | 5.7 → 5.2 (-8%) | 8.4 → 5.7 (-32%) | 100.0 → 100.0 | 100.00 → 100.00 | 100.0 → 100.0 |  |
-| t3 | T3 | None | 3.2 → 3.4 (+5%) | 6.8 → 5.5 (-18%) | 5,843 → 5,836 (-0%) | 94.3 → 94.3 | 100.00 → 100.00 | 94.3 → 94.3 | slow P50 2,252 → 2,253, slow P95 7,831 → 7,828 |
-| t4 | T4 | None | 3.0 → 3.1 (+5%) | 4.8 → 5.1 (+6%) | 5.4 → 6.2 (+14%) | 98.4 → 98.4 | 100.00 → 100.00 | 98.2 → 98.2 | recovery P50 1.9 → 1.9, P95 2.1 → 2.0 |
-| t5 | T1 | bandwidth_2mbit | 1.4 → 1.4 (+1%) | 3.4 → 3.5 (+3%) | 5.5 → 5.6 (+1%) | 100.0 → 100.0 | 100.00 → 100.00 | 100.0 → 100.0 |  |
-| t6 | T2 | bandwidth_2mbit | 63.3 → 20.8 (-67%) | 109.7 → 43.3 (-60%) | 118.5 → 56.4 (-52%) | 100.0 → 100.0 | 100.00 → 100.00 | 33.3 → 33.3 |  |
-| t7 | T3 | bandwidth_2mbit | 62.7 → 20.1 (-68%) | 108.3 → 38.9 (-64%) | 116.7 → 53.7 (-54%) | 100.0 → 100.0 | 100.00 → 100.00 | 33.3 → 33.3 | slow P50 60.8 → 29.6, slow P95 106.8 → 46.6 |
-| t8 | T4 | bandwidth_2mbit | 38.2 → 14.0 (-63%) | 106.0 → 38.2 (-64%) | 114.7 → 52.5 (-54%) | 98.4 → 98.4 | 100.00 → 100.00 | 41.5 → 41.4 | recovery P50 4.2 → 7.9, P95 14.5 → 19.7 |
-| t9 | T1 | delay_100ms | 242.1 → 195.7 (-19%) | 310.0 → 240.8 (-22%) | 334.1 → 262.4 (-21%) | 100.0 → 100.0 | 100.00 → 100.00 | 33.9 → 34.2 |  |
-| t10 | T2 | delay_100ms | 249.1 → 201.8 (-19%) | 316.9 → 247.5 (-22%) | 338.6 → 265.2 (-22%) | 100.0 → 100.0 | 100.00 → 100.00 | 33.6 → 33.7 |  |
-| t11 | T3 | delay_100ms | 253.1 → 203.7 (-20%) | 319.4 → 248.8 (-22%) | 340.5 → 267.8 (-21%) | 100.0 → 100.0 | 100.00 → 100.00 | 33.6 → 33.5 | slow P50 253.2 → 204.1, slow P95 319.4 → 251.2 |
-| t12 | T4 | delay_100ms | 250.1 → 202.6 (-19%) | 316.3 → 249.2 (-21%) | 341.3 → 267.7 (-22%) | 98.2 → 98.2 | 100.00 → 100.00 | 32.9 → 32.9 | recovery P50 202.0 → 209.1, P95 249.5 → 239.7 |
-| t13 | T1 | delay_loss | 300.3 → 254.0 (-15%) | 758.2 → 664.8 (-12%) | 832.9 → 728.7 (-13%) | 84.8 → 91.6 | 100.00 → 100.00 | 33.3 → 33.4 |  |
-| t14 | T2 | delay_loss | 305.0 → 248.6 (-18%) | 635.2 → 648.9 (+2%) | 861.9 → 733.7 (-15%) | 88.7 → 91.9 | 100.00 → 100.00 | 33.4 → 33.4 |  |
-| t15 | T3 | delay_loss | 301.5 → 253.0 (-16%) | 532.6 → 686.5 (+29%) | 726.0 → 892.0 (+23%) | 93.4 → 89.0 | 100.00 → 100.00 | 33.4 → 33.4 | slow P50 297.9 → 260.3, slow P95 558.3 → 727.7 |
-| t16 | T4 | delay_loss | 302.2 → 252.2 (-17%) | 815.4 → 718.5 (-12%) | 1,085 → 1,036 (-5%) | 81.0 → 86.9 | 99.34 → 100.00 | 32.6 → 32.6 | recovery P50 251.3 → 240.0, P95 338.9 → 583.5 |
-| t17 | T1 | loss_3pct | 1.2 → 1.3 (+6%) | 90.7 → 2.9 (-97%) | 228.4 → 14.1 (-94%) | 100.0 → 100.0 | 100.00 → 100.00 | 58.6 → 58.7 |  |
-| t18 | T2 | loss_3pct | 19.9 → 3.1 (-84%) | 95.2 → 7.6 (-92%) | 241.4 → 216.5 (-10%) | 100.0 → 100.0 | 100.00 → 100.00 | 44.4 → 47.2 |  |
-| t19 | T3 | loss_3pct | 34.2 → 3.5 (-90%) | 207.7 → 217.1 (+5%) | 4,893 → 4,831 (-1%) | 97.0 → 97.0 | 100.00 → 100.00 | 41.8 → 42.1 | slow P50 83.5 → 4.8, slow P95 6,494 → 6,593 |
-| t20 | T4 | loss_3pct | 24.4 → 2.9 (-88%) | 96.4 → 5.4 (-94%) | 257.0 → 213.6 (-17%) | 98.4 → 98.6 | 100.00 → 100.00 | 42.5 → 42.5 | recovery P50 0.5 → 1.6, P95 0.8 → 1.7 |
-| t21 | T1 | reorder | 41.4 → 41.4 (+0%) | 42.0 → 42.0 (+0%) | 42.2 → 42.2 (-0%) | 100.0 → 100.0 | 100.00 → 100.00 | 100.0 → 100.0 |  |
-| t22 | T2 | reorder | 43.4 → 43.6 (+0%) | 44.9 → 45.3 (+1%) | 45.3 → 45.8 (+1%) | 100.0 → 100.0 | 100.00 → 100.00 | 100.0 → 100.0 |  |
-| t23 | T3 | reorder | 43.2 → 43.5 (+1%) | 45.7 → 45.8 (+0%) | 5,876 → 5,879 (+0%) | 94.3 → 94.3 | 100.00 → 100.00 | 94.3 → 94.3 | slow P50 2,291 → 2,294, slow P95 7,865 → 7,871 |
-| t24 | T4 | reorder | 42.9 → 43.3 (+1%) | 44.6 → 45.1 (+1%) | 45.2 → 45.7 (+1%) | 98.4 → 98.4 | 100.00 → 100.00 | 98.2 → 98.2 | recovery P50 40.3 → 40.3, P95 40.6 → 40.9 |
-
-The per-test tables below list every v4 and v5 run (3 rows each per test).
+| Test | Scenario | Network | P50 | P95 | P99 | Fresh-final % | Coverage % | Extra |
+|---|---|---|---|---|---|---|---|---|
+| t1 | T1 | None | 1.5 → 1.3 → 1.6 | 2.4 → 2.0 → 2.2 | 2.9 → 2.2 → 3.4 | 100.0 → 100.0 → 100.0 | 100.0 → 100.0 → 100.0 |  |
+| t2 | T2 | None | 3.6 → 3.5 → 3.8 | 5.7 → 5.2 → 5.6 | 8.4 → 5.7 → 6.8 | 100.0 → 100.0 → 100.0 | 100.0 → 100.0 → 100.0 |  |
+| t3 | T3 | None | 3.2 → 3.4 → 3.7 | 6.8 → 5.5 → 6.5 | 5,843 → 5,836 → 6,589 | 94.3 → 94.3 → 93.8 | 94.3 → 94.3 → 94.4 | slow P95 7,831 → 7,828 → 8,555, slow fresh % 35.4 → 35.4 → 30.7 |
+| t4 | T4 | None | 3.0 → 3.1 → 3.4 | 4.8 → 5.1 → 5.4 | 5.4 → 6.2 → 7.2 | 98.4 → 98.4 → 98.4 | 98.2 → 98.2 → 98.2 | recovery P95 2.1 → 2.0 → 3.0 |
+| t5 | T1 | bandwidth_2mbit | 1.4 → 1.4 → 1.7 | 3.4 → 3.5 → 2.9 | 5.5 → 5.6 → 4.9 | 100.0 → 100.0 → 100.0 | 100.0 → 100.0 → 100.0 |  |
+| t6 | T2 | bandwidth_2mbit | 63.3 → 20.8 → 22.3 | 109.7 → 43.3 → 43.3 | 118.5 → 56.4 → 47.1 | 100.0 → 100.0 → 100.0 | 33.3 → 33.3 → 100.0 |  |
+| t7 | T3 | bandwidth_2mbit | 62.7 → 20.1 → 21.5 | 108.3 → 38.9 → 43.7 | 116.7 → 53.7 → 6,112 | 100.0 → 100.0 → 94.1 | 33.3 → 33.3 → 94.4 | slow P95 106.8 → 46.6 → 8,167, slow fresh % 100.0 → 100.0 → 33.0 |
+| t8 | T4 | bandwidth_2mbit | 38.2 → 14.0 → 21.8 | 106.0 → 38.2 → 42.4 | 114.7 → 52.5 → 47.0 | 98.4 → 98.4 → 98.4 | 41.5 → 41.4 → 98.2 | recovery P95 14.5 → 19.7 → 48.0 |
+| t9 | T1 | delay_100ms | 242.1 → 195.7 → 203.0 | 310.0 → 240.8 → 247.3 | 334.1 → 262.4 → 263.7 | 100.0 → 100.0 → 100.0 | 33.9 → 34.2 → 100.0 |  |
+| t10 | T2 | delay_100ms | 249.1 → 201.8 → 200.0 | 316.9 → 247.5 → 244.5 | 338.6 → 265.2 → 261.5 | 100.0 → 100.0 → 100.0 | 33.6 → 33.7 → 100.0 |  |
+| t11 | T3 | delay_100ms | 253.1 → 203.7 → 203.1 | 319.4 → 248.8 → 263.9 | 340.5 → 267.8 → 6,501 | 100.0 → 100.0 → 93.9 | 33.6 → 33.5 → 94.4 | slow P95 319.4 → 251.2 → 8,472, slow fresh % 99.7 → 100.0 → 31.1 |
+| t12 | T4 | delay_100ms | 250.1 → 202.6 → 203.5 | 316.3 → 249.2 → 249.7 | 341.3 → 267.7 → 269.3 | 98.2 → 98.2 → 98.2 | 32.9 → 32.9 → 98.0 | recovery P95 249.5 → 239.7 → 232.4 |
+| t13 | T1 | delay_loss | 300.3 → 254.0 → 251.5 | 758.2 → 664.8 → 524.5 | 832.9 → 728.7 → 726.7 | 84.8 → 91.6 → 90.7 | 33.3 → 33.4 → 93.9 |  |
+| t14 | T2 | delay_loss | 305.0 → 248.6 → 254.2 | 635.2 → 648.9 → 575.1 | 861.9 → 733.7 → 763.3 | 88.7 → 91.9 → 88.0 | 33.4 → 33.4 → 84.5 |  |
+| t15 | T3 | delay_loss | 301.5 → 253.0 → 254.3 | 532.6 → 686.5 → 819.9 | 726.0 → 892.0 → 7,067 | 93.4 → 89.0 → 85.8 | 33.4 → 33.4 → 79.2 | slow P95 558.3 → 727.7 → 8,782, slow fresh % 92.5 → 87.5 → 27.6 |
+| t16 | T4 | delay_loss | 302.2 → 252.2 → 254.0 | 815.4 → 718.5 → 509.0 | 1,085 → 1,036 → 788.8 | 81.0 → 86.9 → 91.1 | 32.6 → 32.6 → 85.7 | recovery P95 338.9 → 583.5 → 341.4 |
+| t17 | T1 | loss_3pct | 1.2 → 1.3 → 1.6 | 90.7 → 2.9 → 3.4 | 228.4 → 14.1 → 208.2 | 100.0 → 100.0 → 100.0 | 58.6 → 58.7 → 99.8 |  |
+| t18 | T2 | loss_3pct | 19.9 → 3.1 → 4.1 | 95.2 → 7.6 → 6.8 | 241.4 → 216.5 → 212.0 | 100.0 → 100.0 → 100.0 | 44.4 → 47.2 → 98.5 |  |
+| t19 | T3 | loss_3pct | 34.2 → 3.5 → 4.1 | 207.7 → 217.1 → 9.5 | 4,893 → 4,831 → 6,553 | 97.0 → 97.0 → 93.8 | 41.8 → 42.1 → 91.7 | slow P95 6,494 → 6,593 → 8,357, slow fresh % 62.4 → 62.3 → 30.7 |
+| t20 | T4 | loss_3pct | 24.4 → 2.9 → 3.5 | 96.4 → 5.4 → 6.3 | 257.0 → 213.6 → 10.2 | 98.4 → 98.6 → 98.3 | 42.5 → 42.5 → 96.2 | recovery P95 0.8 → 1.7 → 4.3 |
+| t21 | T1 | reorder | 41.4 → 41.4 → 41.4 | 42.0 → 42.0 → 42.4 | 42.2 → 42.2 → 42.9 | 100.0 → 100.0 → 100.0 | 100.0 → 100.0 → 100.0 |  |
+| t22 | T2 | reorder | 43.4 → 43.6 → 44.0 | 44.9 → 45.3 → 46.3 | 45.3 → 45.8 → 48.4 | 100.0 → 100.0 → 100.0 | 100.0 → 100.0 → 100.0 |  |
+| t23 | T3 | reorder | 43.2 → 43.5 → 43.9 | 45.7 → 45.8 → 47.9 | 5,876 → 5,879 → 6,631 | 94.3 → 94.3 → 93.8 | 94.3 → 94.3 → 94.4 | slow P95 7,865 → 7,871 → 8,595, slow fresh % 35.4 → 35.4 → 30.7 |
+| t24 | T4 | reorder | 42.9 → 43.3 → 43.5 | 44.6 → 45.1 → 45.8 | 45.2 → 45.7 → 47.6 | 98.4 → 98.4 → 98.4 | 98.2 → 98.2 → 98.2 | recovery P95 40.6 → 40.9 → 40.6 |
 
 ## T1 Basic (20 clients, 20 s)
 
 | Test | Network | Version | Run | P50 ms | P95 ms | P99 ms | Fresh % | Fresh final % | Final complete % | Update coverage % | Dup | Stale | Conn err |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| t1 | None | v4 | 1 | 1.4 | 2.1 | 2.5 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t1 | None | v4 | 2 | 1.5 | 2.4 | 2.9 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t1 | None | v4 | 3 | 1.5 | 2.5 | 3.0 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t1 | None | v5 | 1 | 1.5 | 2.3 | 2.5 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t1 | None | v5 | 2 | 1.3 | 1.8 | 2.0 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t1 | None | v5 | 3 | 1.3 | 2.0 | 2.2 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t5 | bandwidth_2mbit | v4 | 1 | 1.4 | 3.4 | 5.5 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t5 | bandwidth_2mbit | v4 | 2 | 1.4 | 3.2 | 5.1 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t5 | bandwidth_2mbit | v4 | 3 | 1.2 | 4.0 | 5.8 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t5 | bandwidth_2mbit | v5 | 1 | 1.4 | 3.5 | 6.1 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t5 | bandwidth_2mbit | v5 | 2 | 1.4 | 3.4 | 5.1 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t5 | bandwidth_2mbit | v5 | 3 | 1.3 | 3.7 | 5.6 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t9 | delay_100ms | v4 | 1 | 241.9 | 310.0 | 338.1 | 100.00 | 100.00 | 100.00 | 33.86 | 0 | 0 | 0 |
-| t9 | delay_100ms | v4 | 2 | 248.4 | 310.3 | 334.1 | 100.00 | 100.00 | 100.00 | 34.02 | 0 | 0 | 0 |
-| t9 | delay_100ms | v4 | 3 | 242.1 | 305.7 | 322.7 | 100.00 | 100.00 | 100.00 | 33.71 | 0 | 0 | 0 |
-| t9 | delay_100ms | v5 | 1 | 192.9 | 236.1 | 248.2 | 100.00 | 100.00 | 100.00 | 34.24 | 0 | 0 | 0 |
-| t9 | delay_100ms | v5 | 2 | 195.7 | 240.8 | 265.5 | 100.00 | 100.00 | 100.00 | 33.79 | 0 | 0 | 0 |
-| t9 | delay_100ms | v5 | 3 | 201.2 | 247.3 | 262.4 | 100.00 | 100.00 | 100.00 | 34.24 | 0 | 0 | 0 |
-| t13 | delay_loss | v4 | 1 | 300.3 | 758.2 | 832.9 | 81.59 | 81.59 | 100.00 | 33.33 | 0 | 0 | 0 |
-| t13 | delay_loss | v4 | 2 | 316.6 | 828.4 | 974.1 | 84.81 | 84.77 | 100.00 | 33.41 | 0 | 0 | 0 |
-| t13 | delay_loss | v4 | 3 | 296.3 | 740.8 | 832.2 | 90.68 | 90.68 | 100.00 | 33.33 | 0 | 0 | 0 |
-| t13 | delay_loss | v5 | 1 | 248.1 | 629.2 | 699.4 | 92.76 | 92.73 | 100.00 | 33.48 | 0 | 0 | 0 |
-| t13 | delay_loss | v5 | 2 | 261.0 | 707.5 | 872.9 | 82.09 | 82.05 | 100.00 | 33.41 | 0 | 0 | 0 |
-| t13 | delay_loss | v5 | 3 | 254.0 | 664.8 | 728.7 | 91.59 | 91.59 | 100.00 | 33.33 | 0 | 0 | 0 |
-| t17 | loss_3pct | v4 | 1 | 1.2 | 90.7 | 228.4 | 100.00 | 100.00 | 100.00 | 64.32 | 0 | 0 | 0 |
-| t17 | loss_3pct | v4 | 2 | 1.2 | 88.0 | 99.7 | 100.00 | 100.00 | 100.00 | 57.88 | 0 | 0 | 0 |
-| t17 | loss_3pct | v4 | 3 | 1.3 | 207.1 | 300.7 | 100.00 | 100.00 | 100.00 | 58.56 | 0 | 0 | 0 |
-| t17 | loss_3pct | v5 | 1 | 1.2 | 2.0 | 2.5 | 100.00 | 100.00 | 100.00 | 58.71 | 0 | 0 | 0 |
-| t17 | loss_3pct | v5 | 2 | 1.3 | 2.9 | 206.1 | 100.00 | 100.00 | 100.00 | 71.14 | 0 | 0 | 0 |
-| t17 | loss_3pct | v5 | 3 | 1.5 | 3.5 | 14.1 | 100.00 | 100.00 | 100.00 | 53.41 | 0 | 0 | 0 |
-| t21 | reorder | v4 | 1 | 41.3 | 41.7 | 42.0 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t21 | reorder | v4 | 2 | 41.4 | 42.1 | 42.8 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t21 | reorder | v4 | 3 | 41.5 | 42.0 | 42.2 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t21 | reorder | v5 | 1 | 41.4 | 42.0 | 42.2 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t21 | reorder | v5 | 2 | 41.4 | 41.9 | 42.1 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t21 | reorder | v5 | 3 | 41.4 | 42.1 | 42.3 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t1 | None | v5 | 1 | 1.4 | 2.1 | 2.5 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t1 | None | v5 | 2 | 1.5 | 2.4 | 2.9 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t1 | None | v5 | 3 | 1.5 | 2.5 | 3.0 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t1 | None | v6 | 1 | 1.5 | 2.3 | 2.5 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t1 | None | v6 | 2 | 1.3 | 1.8 | 2.0 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t1 | None | v6 | 3 | 1.3 | 2.0 | 2.2 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t1 | None | v7 | 1 | 1.6 | 2.2 | 3.5 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t1 | None | v7 | 2 | 1.7 | 2.9 | 3.4 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t1 | None | v7 | 3 | 1.5 | 2.2 | 2.7 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t5 | bandwidth_2mbit | v5 | 1 | 1.4 | 3.4 | 5.5 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t5 | bandwidth_2mbit | v5 | 2 | 1.4 | 3.2 | 5.1 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t5 | bandwidth_2mbit | v5 | 3 | 1.2 | 4.0 | 5.8 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t5 | bandwidth_2mbit | v6 | 1 | 1.4 | 3.5 | 6.1 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t5 | bandwidth_2mbit | v6 | 2 | 1.4 | 3.4 | 5.1 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t5 | bandwidth_2mbit | v6 | 3 | 1.3 | 3.7 | 5.6 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t5 | bandwidth_2mbit | v7 | 1 | 1.7 | 2.8 | 5.2 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t5 | bandwidth_2mbit | v7 | 2 | 1.6 | 3.1 | 4.7 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t5 | bandwidth_2mbit | v7 | 3 | 1.7 | 2.9 | 4.9 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t9 | delay_100ms | v5 | 1 | 241.9 | 310.0 | 338.1 | 100.00 | 100.00 | 100.00 | 33.86 | 0 | 0 | 0 |
+| t9 | delay_100ms | v5 | 2 | 248.4 | 310.3 | 334.1 | 100.00 | 100.00 | 100.00 | 34.02 | 0 | 0 | 0 |
+| t9 | delay_100ms | v5 | 3 | 242.1 | 305.7 | 322.7 | 100.00 | 100.00 | 100.00 | 33.71 | 0 | 0 | 0 |
+| t9 | delay_100ms | v6 | 1 | 192.9 | 236.1 | 248.2 | 100.00 | 100.00 | 100.00 | 34.24 | 0 | 0 | 0 |
+| t9 | delay_100ms | v6 | 2 | 195.7 | 240.8 | 265.5 | 100.00 | 100.00 | 100.00 | 33.79 | 0 | 0 | 0 |
+| t9 | delay_100ms | v6 | 3 | 201.2 | 247.3 | 262.4 | 100.00 | 100.00 | 100.00 | 34.24 | 0 | 0 | 0 |
+| t9 | delay_100ms | v7 | 1 | 196.8 | 244.4 | 260.8 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t9 | delay_100ms | v7 | 2 | 203.0 | 247.3 | 264.8 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t9 | delay_100ms | v7 | 3 | 203.2 | 249.3 | 263.7 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t13 | delay_loss | v5 | 1 | 300.3 | 758.2 | 832.9 | 81.59 | 81.59 | 100.00 | 33.33 | 0 | 0 | 0 |
+| t13 | delay_loss | v5 | 2 | 316.6 | 828.4 | 974.1 | 84.81 | 84.77 | 100.00 | 33.41 | 0 | 0 | 0 |
+| t13 | delay_loss | v5 | 3 | 296.3 | 740.8 | 832.2 | 90.68 | 90.68 | 100.00 | 33.33 | 0 | 0 | 0 |
+| t13 | delay_loss | v6 | 1 | 248.1 | 629.2 | 699.4 | 92.76 | 92.73 | 100.00 | 33.48 | 0 | 0 | 0 |
+| t13 | delay_loss | v6 | 2 | 261.0 | 707.5 | 872.9 | 82.09 | 82.05 | 100.00 | 33.41 | 0 | 0 | 0 |
+| t13 | delay_loss | v6 | 3 | 254.0 | 664.8 | 728.7 | 91.59 | 91.59 | 100.00 | 33.33 | 0 | 0 | 0 |
+| t13 | delay_loss | v7 | 1 | 251.5 | 524.5 | 726.7 | 94.52 | 90.68 | 100.00 | 93.94 | 0 | 0 | 0 |
+| t13 | delay_loss | v7 | 2 | 250.9 | 465.4 | 634.8 | 96.33 | 94.09 | 100.00 | 96.97 | 0 | 0 | 0 |
+| t13 | delay_loss | v7 | 3 | 257.0 | 631.9 | 1037.6 | 91.80 | 85.23 | 100.00 | 91.44 | 0 | 0 | 0 |
+| t17 | loss_3pct | v5 | 1 | 1.2 | 90.7 | 228.4 | 100.00 | 100.00 | 100.00 | 64.32 | 0 | 0 | 0 |
+| t17 | loss_3pct | v5 | 2 | 1.2 | 88.0 | 99.7 | 100.00 | 100.00 | 100.00 | 57.88 | 0 | 0 | 0 |
+| t17 | loss_3pct | v5 | 3 | 1.3 | 207.1 | 300.7 | 100.00 | 100.00 | 100.00 | 58.56 | 0 | 0 | 0 |
+| t17 | loss_3pct | v6 | 1 | 1.2 | 2.0 | 2.5 | 100.00 | 100.00 | 100.00 | 58.71 | 0 | 0 | 0 |
+| t17 | loss_3pct | v6 | 2 | 1.3 | 2.9 | 206.1 | 100.00 | 100.00 | 100.00 | 71.14 | 0 | 0 | 0 |
+| t17 | loss_3pct | v6 | 3 | 1.5 | 3.5 | 14.1 | 100.00 | 100.00 | 100.00 | 53.41 | 0 | 0 | 0 |
+| t17 | loss_3pct | v7 | 1 | 2.0 | 3.4 | 210.4 | 100.00 | 100.00 | 100.00 | 99.92 | 0 | 0 | 0 |
+| t17 | loss_3pct | v7 | 2 | 1.6 | 207.3 | 208.2 | 100.00 | 100.00 | 100.00 | 98.41 | 0 | 0 | 0 |
+| t17 | loss_3pct | v7 | 3 | 1.5 | 2.7 | 208.2 | 100.00 | 100.00 | 100.00 | 99.77 | 0 | 0 | 0 |
+| t21 | reorder | v5 | 1 | 41.3 | 41.7 | 42.0 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t21 | reorder | v5 | 2 | 41.4 | 42.1 | 42.8 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t21 | reorder | v5 | 3 | 41.5 | 42.0 | 42.2 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t21 | reorder | v6 | 1 | 41.4 | 42.0 | 42.2 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t21 | reorder | v6 | 2 | 41.4 | 41.9 | 42.1 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t21 | reorder | v6 | 3 | 41.4 | 42.1 | 42.3 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t21 | reorder | v7 | 1 | 41.4 | 42.1 | 42.5 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t21 | reorder | v7 | 2 | 41.4 | 42.4 | 42.9 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t21 | reorder | v7 | 3 | 41.6 | 42.6 | 43.0 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
 
-Median P95 vs no-impairment baseline (v4): bandwidth_2mbit 1×, delay_100ms 127×, delay_loss 310×, loss_3pct 37×, reorder 17×
+Median P95 vs no-impairment baseline (v5): bandwidth_2mbit 1×, delay_100ms 127×, delay_loss 310×, loss_3pct 37×, reorder 17×
 
-Median P95 vs no-impairment baseline (v5): bandwidth_2mbit 2×, delay_100ms 121×, delay_loss 333×, loss_3pct 1×, reorder 21×
+Median P95 vs no-impairment baseline (v6): bandwidth_2mbit 2×, delay_100ms 121×, delay_loss 333×, loss_3pct 1×, reorder 21×
+
+Median P95 vs no-impairment baseline (v7): bandwidth_2mbit 1×, delay_100ms 113×, delay_loss 240×, loss_3pct 2×, reorder 19×
 
 ## T2 Scale (100 clients, 40 s)
 
 | Test | Network | Version | Run | P50 ms | P95 ms | P99 ms | Fresh % | Fresh final % | Final complete % | Update coverage % | Dup | Stale | Conn err |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| t2 | None | v4 | 1 | 3.7 | 5.8 | 8.4 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t2 | None | v4 | 2 | 3.6 | 5.7 | 8.4 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t2 | None | v4 | 3 | 3.3 | 5.0 | 5.4 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t2 | None | v5 | 1 | 3.4 | 5.0 | 5.3 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t2 | None | v5 | 2 | 3.5 | 5.2 | 5.7 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t2 | None | v5 | 3 | 3.5 | 5.3 | 5.8 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t6 | bandwidth_2mbit | v4 | 1 | 63.3 | 110.0 | 119.8 | 100.00 | 100.00 | 100.00 | 33.33 | 0 | 0 | 0 |
-| t6 | bandwidth_2mbit | v4 | 2 | 63.0 | 109.1 | 118.4 | 100.00 | 100.00 | 100.00 | 33.33 | 0 | 0 | 0 |
-| t6 | bandwidth_2mbit | v4 | 3 | 63.5 | 109.7 | 118.5 | 100.00 | 100.00 | 100.00 | 33.33 | 0 | 0 | 0 |
-| t6 | bandwidth_2mbit | v5 | 1 | 20.8 | 43.2 | 56.1 | 100.00 | 100.00 | 100.00 | 33.33 | 0 | 0 | 0 |
-| t6 | bandwidth_2mbit | v5 | 2 | 20.7 | 43.8 | 56.4 | 100.00 | 100.00 | 100.00 | 33.33 | 0 | 0 | 0 |
-| t6 | bandwidth_2mbit | v5 | 3 | 21.0 | 43.3 | 56.6 | 100.00 | 100.00 | 100.00 | 33.33 | 0 | 0 | 0 |
-| t10 | delay_100ms | v4 | 1 | 249.1 | 311.8 | 333.4 | 100.00 | 100.00 | 100.00 | 33.61 | 0 | 0 | 0 |
-| t10 | delay_100ms | v4 | 2 | 251.9 | 316.9 | 340.7 | 100.00 | 100.00 | 100.00 | 33.65 | 0 | 0 | 0 |
-| t10 | delay_100ms | v4 | 3 | 246.9 | 317.8 | 338.6 | 100.00 | 100.00 | 100.00 | 33.60 | 0 | 0 | 0 |
-| t10 | delay_100ms | v5 | 1 | 201.8 | 247.5 | 265.2 | 100.00 | 100.00 | 100.00 | 33.68 | 0 | 0 | 0 |
-| t10 | delay_100ms | v5 | 2 | 208.5 | 255.2 | 274.6 | 100.00 | 100.00 | 100.00 | 33.59 | 0 | 0 | 0 |
-| t10 | delay_100ms | v5 | 3 | 195.3 | 238.6 | 256.8 | 100.00 | 100.00 | 100.00 | 33.67 | 0 | 0 | 0 |
-| t14 | delay_loss | v4 | 1 | 307.1 | 587.8 | 703.3 | 88.73 | 88.71 | 100.00 | 33.38 | 0 | 0 | 0 |
-| t14 | delay_loss | v4 | 2 | 303.9 | 635.2 | 861.9 | 88.77 | 88.76 | 100.00 | 33.37 | 0 | 0 | 0 |
-| t14 | delay_loss | v4 | 3 | 305.0 | 727.9 | 1066.3 | 88.37 | 88.37 | 100.00 | 33.34 | 0 | 0 | 0 |
-| t14 | delay_loss | v5 | 1 | 248.6 | 648.9 | 733.7 | 91.96 | 91.94 | 100.00 | 33.41 | 0 | 0 | 0 |
-| t14 | delay_loss | v5 | 2 | 252.5 | 747.7 | 983.6 | 86.73 | 86.67 | 100.00 | 33.33 | 0 | 0 | 0 |
-| t14 | delay_loss | v5 | 3 | 246.9 | 540.4 | 724.5 | 93.05 | 93.04 | 100.00 | 33.36 | 0 | 0 | 0 |
-| t18 | loss_3pct | v4 | 1 | 21.1 | 95.2 | 241.4 | 99.98 | 99.94 | 100.00 | 44.39 | 0 | 0 | 0 |
-| t18 | loss_3pct | v4 | 2 | 19.9 | 91.6 | 99.1 | 99.98 | 99.98 | 100.00 | 44.27 | 0 | 0 | 0 |
-| t18 | loss_3pct | v4 | 3 | 12.2 | 211.4 | 288.6 | 99.99 | 99.98 | 100.00 | 47.48 | 0 | 0 | 0 |
-| t18 | loss_3pct | v5 | 1 | 3.1 | 7.6 | 213.4 | 99.97 | 99.96 | 100.00 | 47.16 | 0 | 0 | 0 |
-| t18 | loss_3pct | v5 | 2 | 3.0 | 207.9 | 216.5 | 100.00 | 100.00 | 100.00 | 47.33 | 0 | 0 | 0 |
-| t18 | loss_3pct | v5 | 3 | 3.1 | 6.1 | 234.0 | 100.00 | 100.00 | 100.00 | 46.82 | 0 | 0 | 0 |
-| t22 | reorder | v4 | 1 | 43.3 | 44.8 | 45.3 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t22 | reorder | v4 | 2 | 43.4 | 44.9 | 45.3 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t22 | reorder | v4 | 3 | 43.4 | 45.2 | 46.5 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t22 | reorder | v5 | 1 | 43.7 | 45.3 | 45.8 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t22 | reorder | v5 | 2 | 43.6 | 45.3 | 47.2 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
-| t22 | reorder | v5 | 3 | 43.4 | 44.9 | 45.3 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t2 | None | v5 | 1 | 3.7 | 5.8 | 8.4 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t2 | None | v5 | 2 | 3.6 | 5.7 | 8.4 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t2 | None | v5 | 3 | 3.3 | 5.0 | 5.4 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t2 | None | v6 | 1 | 3.4 | 5.0 | 5.3 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t2 | None | v6 | 2 | 3.5 | 5.2 | 5.7 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t2 | None | v6 | 3 | 3.5 | 5.3 | 5.8 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t2 | None | v7 | 1 | 3.8 | 5.6 | 6.8 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t2 | None | v7 | 2 | 3.9 | 7.0 | 9.6 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t2 | None | v7 | 3 | 3.8 | 5.6 | 6.0 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t6 | bandwidth_2mbit | v5 | 1 | 63.3 | 110.0 | 119.8 | 100.00 | 100.00 | 100.00 | 33.33 | 0 | 0 | 0 |
+| t6 | bandwidth_2mbit | v5 | 2 | 63.0 | 109.1 | 118.4 | 100.00 | 100.00 | 100.00 | 33.33 | 0 | 0 | 0 |
+| t6 | bandwidth_2mbit | v5 | 3 | 63.5 | 109.7 | 118.5 | 100.00 | 100.00 | 100.00 | 33.33 | 0 | 0 | 0 |
+| t6 | bandwidth_2mbit | v6 | 1 | 20.8 | 43.2 | 56.1 | 100.00 | 100.00 | 100.00 | 33.33 | 0 | 0 | 0 |
+| t6 | bandwidth_2mbit | v6 | 2 | 20.7 | 43.8 | 56.4 | 100.00 | 100.00 | 100.00 | 33.33 | 0 | 0 | 0 |
+| t6 | bandwidth_2mbit | v6 | 3 | 21.0 | 43.3 | 56.6 | 100.00 | 100.00 | 100.00 | 33.33 | 0 | 0 | 0 |
+| t6 | bandwidth_2mbit | v7 | 1 | 22.3 | 43.1 | 47.0 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t6 | bandwidth_2mbit | v7 | 2 | 22.3 | 43.3 | 47.1 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t6 | bandwidth_2mbit | v7 | 3 | 22.2 | 43.3 | 47.1 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t10 | delay_100ms | v5 | 1 | 249.1 | 311.8 | 333.4 | 100.00 | 100.00 | 100.00 | 33.61 | 0 | 0 | 0 |
+| t10 | delay_100ms | v5 | 2 | 251.9 | 316.9 | 340.7 | 100.00 | 100.00 | 100.00 | 33.65 | 0 | 0 | 0 |
+| t10 | delay_100ms | v5 | 3 | 246.9 | 317.8 | 338.6 | 100.00 | 100.00 | 100.00 | 33.60 | 0 | 0 | 0 |
+| t10 | delay_100ms | v6 | 1 | 201.8 | 247.5 | 265.2 | 100.00 | 100.00 | 100.00 | 33.68 | 0 | 0 | 0 |
+| t10 | delay_100ms | v6 | 2 | 208.5 | 255.2 | 274.6 | 100.00 | 100.00 | 100.00 | 33.59 | 0 | 0 | 0 |
+| t10 | delay_100ms | v6 | 3 | 195.3 | 238.6 | 256.8 | 100.00 | 100.00 | 100.00 | 33.67 | 0 | 0 | 0 |
+| t10 | delay_100ms | v7 | 1 | 200.0 | 246.7 | 266.4 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t10 | delay_100ms | v7 | 2 | 201.3 | 244.5 | 261.0 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t10 | delay_100ms | v7 | 3 | 198.2 | 243.4 | 261.5 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t14 | delay_loss | v5 | 1 | 307.1 | 587.8 | 703.3 | 88.73 | 88.71 | 100.00 | 33.38 | 0 | 0 | 0 |
+| t14 | delay_loss | v5 | 2 | 303.9 | 635.2 | 861.9 | 88.77 | 88.76 | 100.00 | 33.37 | 0 | 0 | 0 |
+| t14 | delay_loss | v5 | 3 | 305.0 | 727.9 | 1066.3 | 88.37 | 88.37 | 100.00 | 33.34 | 0 | 0 | 0 |
+| t14 | delay_loss | v6 | 1 | 248.6 | 648.9 | 733.7 | 91.96 | 91.94 | 100.00 | 33.41 | 0 | 0 | 0 |
+| t14 | delay_loss | v6 | 2 | 252.5 | 747.7 | 983.6 | 86.73 | 86.67 | 100.00 | 33.33 | 0 | 0 | 0 |
+| t14 | delay_loss | v6 | 3 | 246.9 | 540.4 | 724.5 | 93.05 | 93.04 | 100.00 | 33.36 | 0 | 0 | 0 |
+| t14 | delay_loss | v7 | 1 | 248.6 | 493.7 | 659.7 | 95.24 | 93.80 | 100.00 | 95.84 | 0 | 0 | 0 |
+| t14 | delay_loss | v7 | 2 | 254.2 | 575.1 | 763.3 | 92.65 | 87.96 | 100.00 | 84.47 | 0 | 0 | 0 |
+| t14 | delay_loss | v7 | 3 | 260.1 | 881.1 | 1592.8 | 88.41 | 81.12 | 100.00 | 78.47 | 0 | 0 | 0 |
+| t18 | loss_3pct | v5 | 1 | 21.1 | 95.2 | 241.4 | 99.98 | 99.94 | 100.00 | 44.39 | 0 | 0 | 0 |
+| t18 | loss_3pct | v5 | 2 | 19.9 | 91.6 | 99.1 | 99.98 | 99.98 | 100.00 | 44.27 | 0 | 0 | 0 |
+| t18 | loss_3pct | v5 | 3 | 12.2 | 211.4 | 288.6 | 99.99 | 99.98 | 100.00 | 47.48 | 0 | 0 | 0 |
+| t18 | loss_3pct | v6 | 1 | 3.1 | 7.6 | 213.4 | 99.97 | 99.96 | 100.00 | 47.16 | 0 | 0 | 0 |
+| t18 | loss_3pct | v6 | 2 | 3.0 | 207.9 | 216.5 | 100.00 | 100.00 | 100.00 | 47.33 | 0 | 0 | 0 |
+| t18 | loss_3pct | v6 | 3 | 3.1 | 6.1 | 234.0 | 100.00 | 100.00 | 100.00 | 46.82 | 0 | 0 | 0 |
+| t18 | loss_3pct | v7 | 1 | 4.0 | 6.0 | 10.2 | 100.00 | 99.96 | 100.00 | 98.54 | 0 | 0 | 0 |
+| t18 | loss_3pct | v7 | 2 | 4.1 | 8.2 | 212.0 | 99.99 | 99.98 | 100.00 | 97.90 | 0 | 0 | 0 |
+| t18 | loss_3pct | v7 | 3 | 4.1 | 6.8 | 214.9 | 99.99 | 99.98 | 100.00 | 99.31 | 0 | 0 | 0 |
+| t22 | reorder | v5 | 1 | 43.3 | 44.8 | 45.3 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t22 | reorder | v5 | 2 | 43.4 | 44.9 | 45.3 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t22 | reorder | v5 | 3 | 43.4 | 45.2 | 46.5 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t22 | reorder | v6 | 1 | 43.7 | 45.3 | 45.8 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t22 | reorder | v6 | 2 | 43.6 | 45.3 | 47.2 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t22 | reorder | v6 | 3 | 43.4 | 44.9 | 45.3 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t22 | reorder | v7 | 1 | 44.0 | 46.9 | 48.9 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t22 | reorder | v7 | 2 | 44.0 | 46.3 | 48.4 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
+| t22 | reorder | v7 | 3 | 43.8 | 45.7 | 47.8 | 100.00 | 100.00 | 100.00 | 100.00 | 0 | 0 | 0 |
 
-Median P95 vs no-impairment baseline (v4): bandwidth_2mbit 19×, delay_100ms 56×, delay_loss 112×, loss_3pct 17×, reorder 8×
+Median P95 vs no-impairment baseline (v5): bandwidth_2mbit 19×, delay_100ms 56×, delay_loss 112×, loss_3pct 17×, reorder 8×
 
-Median P95 vs no-impairment baseline (v5): bandwidth_2mbit 8×, delay_100ms 47×, delay_loss 124×, loss_3pct 1×, reorder 9×
+Median P95 vs no-impairment baseline (v6): bandwidth_2mbit 8×, delay_100ms 47×, delay_loss 124×, loss_3pct 1×, reorder 9×
+
+Median P95 vs no-impairment baseline (v7): bandwidth_2mbit 8×, delay_100ms 44×, delay_loss 103×, loss_3pct 1×, reorder 8×
 
 ## T3 Slow readers (100 clients, 60 s, 10% slow @500 ms)
 
 | Test | Network | Version | Run | P50 ms | P95 ms | P99 ms | Fresh % | Fresh final % | Final complete % | Update coverage % | Dup | Stale | Conn err | Slow P50 ms | Slow P95 ms | Slow fresh % | Normal P95 ms | Normal fresh % |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| t3 | None | v4 | 1 | 3.2 | 7.1 | 5845.4 | 97.02 | 94.34 | 100.00 | 94.34 | 0 | 0 | 0 | 2252.0 | 7831.5 | 35.35 | 4.8 | 100.00 |
-| t3 | None | v4 | 2 | 3.2 | 5.6 | 5839.3 | 97.02 | 94.34 | 100.00 | 94.34 | 0 | 0 | 0 | 2253.0 | 7829.4 | 35.35 | 4.8 | 100.00 |
-| t3 | None | v4 | 3 | 3.3 | 6.8 | 5843.2 | 97.02 | 94.34 | 100.00 | 94.34 | 0 | 0 | 0 | 2251.7 | 7831.6 | 35.35 | 5.0 | 100.00 |
-| t3 | None | v5 | 1 | 3.5 | 5.5 | 5836.4 | 97.02 | 94.34 | 100.00 | 94.34 | 0 | 0 | 0 | 2252.8 | 7827.2 | 35.35 | 5.2 | 100.00 |
-| t3 | None | v5 | 2 | 3.4 | 5.9 | 5834.2 | 97.02 | 94.34 | 100.00 | 94.34 | 0 | 0 | 0 | 2252.0 | 7827.7 | 35.35 | 5.1 | 100.00 |
-| t3 | None | v5 | 3 | 3.4 | 5.5 | 5837.7 | 97.02 | 94.34 | 100.00 | 94.34 | 0 | 0 | 0 | 2253.8 | 7829.4 | 35.35 | 5.2 | 100.00 |
-| t7 | bandwidth_2mbit | v4 | 1 | 62.5 | 108.3 | 116.8 | 100.00 | 100.00 | 100.00 | 33.33 | 0 | 0 | 0 | 60.7 | 106.8 | 100.00 | 108.3 | 100.00 |
-| t7 | bandwidth_2mbit | v4 | 2 | 63.2 | 108.3 | 116.4 | 100.00 | 100.00 | 100.00 | 33.33 | 0 | 0 | 0 | 60.8 | 106.0 | 100.00 | 108.6 | 100.00 |
-| t7 | bandwidth_2mbit | v4 | 3 | 62.7 | 108.5 | 116.7 | 100.00 | 100.00 | 100.00 | 33.33 | 0 | 0 | 0 | 61.8 | 107.0 | 100.00 | 108.7 | 100.00 |
-| t7 | bandwidth_2mbit | v5 | 1 | 20.1 | 38.9 | 53.7 | 100.00 | 100.00 | 100.00 | 33.33 | 0 | 0 | 0 | 29.6 | 47.0 | 100.00 | 38.8 | 100.00 |
-| t7 | bandwidth_2mbit | v5 | 2 | 20.3 | 38.9 | 53.8 | 100.00 | 100.00 | 100.00 | 33.33 | 0 | 0 | 0 | 29.5 | 46.6 | 100.00 | 38.8 | 100.00 |
-| t7 | bandwidth_2mbit | v5 | 3 | 20.1 | 39.0 | 53.5 | 100.00 | 100.00 | 100.00 | 33.33 | 0 | 0 | 0 | 29.6 | 46.5 | 100.00 | 38.8 | 100.00 |
-| t11 | delay_100ms | v4 | 1 | 253.1 | 319.6 | 341.8 | 99.93 | 99.95 | 100.00 | 33.59 | 0 | 0 | 0 | 254.4 | 319.4 | 99.35 | 319.6 | 100.00 |
-| t11 | delay_100ms | v4 | 2 | 252.0 | 318.3 | 340.5 | 99.97 | 99.97 | 100.00 | 33.54 | 0 | 0 | 0 | 252.9 | 317.5 | 99.74 | 318.4 | 100.00 |
-| t11 | delay_100ms | v4 | 3 | 253.4 | 319.4 | 339.6 | 100.00 | 100.00 | 100.00 | 33.57 | 0 | 0 | 0 | 253.2 | 324.3 | 100.00 | 318.8 | 100.00 |
-| t11 | delay_100ms | v5 | 1 | 206.6 | 254.8 | 274.9 | 99.97 | 99.97 | 100.00 | 33.57 | 0 | 0 | 0 | 208.0 | 256.9 | 99.74 | 254.7 | 100.00 |
-| t11 | delay_100ms | v5 | 2 | 202.9 | 248.4 | 266.9 | 100.00 | 100.00 | 100.00 | 33.51 | 0 | 0 | 0 | 204.1 | 248.3 | 100.00 | 248.4 | 100.00 |
-| t11 | delay_100ms | v5 | 3 | 203.7 | 248.8 | 267.8 | 100.00 | 100.00 | 100.00 | 33.50 | 0 | 0 | 0 | 203.7 | 251.2 | 100.00 | 248.6 | 100.00 |
-| t15 | delay_loss | v4 | 1 | 301.5 | 532.6 | 726.0 | 93.48 | 93.43 | 100.00 | 33.36 | 0 | 0 | 0 | 297.9 | 558.3 | 92.50 | 529.9 | 93.59 |
-| t15 | delay_loss | v4 | 2 | 296.1 | 513.1 | 694.5 | 94.45 | 94.45 | 100.00 | 33.35 | 0 | 0 | 0 | 296.5 | 501.4 | 94.88 | 513.1 | 94.40 |
-| t15 | delay_loss | v4 | 3 | 303.9 | 712.2 | 1052.1 | 89.87 | 89.87 | 100.00 | 33.35 | 0 | 0 | 0 | 309.0 | 756.7 | 88.03 | 705.8 | 90.08 |
-| t15 | delay_loss | v5 | 1 | 253.0 | 708.7 | 892.0 | 87.75 | 87.74 | 100.00 | 33.36 | 0 | 0 | 0 | 260.3 | 741.7 | 84.12 | 706.7 | 88.15 |
-| t15 | delay_loss | v5 | 2 | 244.4 | 530.3 | 804.2 | 93.24 | 93.24 | 100.00 | 33.36 | 0 | 0 | 0 | 249.4 | 555.8 | 91.59 | 528.1 | 93.42 |
-| t15 | delay_loss | v5 | 3 | 259.4 | 686.5 | 995.8 | 89.05 | 89.03 | 100.00 | 33.36 | 0 | 0 | 0 | 263.6 | 727.7 | 87.50 | 678.5 | 89.22 |
-| t19 | loss_3pct | v4 | 1 | 34.7 | 207.7 | 5488.2 | 96.01 | 96.61 | 100.00 | 41.81 | 0 | 0 | 0 | 93.8 | 6739.2 | 58.03 | 98.8 | 99.99 |
-| t19 | loss_3pct | v4 | 2 | 34.2 | 98.9 | 4892.9 | 96.41 | 97.04 | 100.00 | 40.69 | 0 | 0 | 0 | 83.5 | 6494.0 | 62.42 | 93.2 | 100.00 |
-| t19 | loss_3pct | v4 | 3 | 32.7 | 226.3 | 3822.4 | 97.26 | 97.64 | 100.00 | 42.06 | 0 | 0 | 0 | 79.2 | 5834.9 | 69.49 | 98.0 | 100.00 |
-| t19 | loss_3pct | v5 | 1 | 3.8 | 440.0 | 6338.0 | 95.00 | 95.74 | 100.00 | 42.14 | 0 | 0 | 0 | 584.0 | 7353.0 | 49.04 | 6.3 | 99.95 |
-| t19 | loss_3pct | v5 | 2 | 3.5 | 8.0 | 3334.0 | 97.19 | 97.61 | 100.00 | 41.90 | 0 | 0 | 0 | 4.6 | 5254.4 | 69.05 | 5.9 | 100.00 |
-| t19 | loss_3pct | v5 | 3 | 3.2 | 217.1 | 4830.9 | 96.59 | 96.97 | 100.00 | 43.03 | 0 | 0 | 0 | 4.8 | 6593.0 | 62.34 | 5.6 | 99.99 |
-| t23 | reorder | v4 | 1 | 43.2 | 45.2 | 5874.5 | 97.04 | 94.37 | 100.00 | 94.34 | 0 | 0 | 0 | 2291.2 | 7841.9 | 35.59 | 44.6 | 100.00 |
-| t23 | reorder | v4 | 2 | 43.3 | 45.7 | 5876.0 | 97.02 | 94.34 | 100.00 | 94.34 | 0 | 0 | 0 | 2289.0 | 7865.4 | 35.35 | 44.7 | 100.00 |
-| t23 | reorder | v4 | 3 | 43.2 | 45.9 | 5880.2 | 97.02 | 94.34 | 100.00 | 94.34 | 0 | 0 | 0 | 2293.9 | 7871.9 | 35.35 | 44.6 | 100.00 |
-| t23 | reorder | v5 | 1 | 43.4 | 45.3 | 5876.8 | 97.02 | 94.34 | 100.00 | 94.34 | 0 | 0 | 0 | 2292.6 | 7859.1 | 35.35 | 44.9 | 100.00 |
-| t23 | reorder | v5 | 2 | 43.6 | 45.9 | 5881.3 | 97.02 | 94.34 | 100.00 | 94.34 | 0 | 0 | 0 | 2295.1 | 7871.2 | 35.35 | 45.2 | 100.00 |
-| t23 | reorder | v5 | 3 | 43.5 | 45.8 | 5878.9 | 97.02 | 94.34 | 100.00 | 94.34 | 0 | 0 | 0 | 2293.9 | 7871.5 | 35.35 | 45.1 | 100.00 |
+| t3 | None | v5 | 1 | 3.2 | 7.1 | 5845.4 | 97.02 | 94.34 | 100.00 | 94.34 | 0 | 0 | 0 | 2252.0 | 7831.5 | 35.35 | 4.8 | 100.00 |
+| t3 | None | v5 | 2 | 3.2 | 5.6 | 5839.3 | 97.02 | 94.34 | 100.00 | 94.34 | 0 | 0 | 0 | 2253.0 | 7829.4 | 35.35 | 4.8 | 100.00 |
+| t3 | None | v5 | 3 | 3.3 | 6.8 | 5843.2 | 97.02 | 94.34 | 100.00 | 94.34 | 0 | 0 | 0 | 2251.7 | 7831.6 | 35.35 | 5.0 | 100.00 |
+| t3 | None | v6 | 1 | 3.5 | 5.5 | 5836.4 | 97.02 | 94.34 | 100.00 | 94.34 | 0 | 0 | 0 | 2252.8 | 7827.2 | 35.35 | 5.2 | 100.00 |
+| t3 | None | v6 | 2 | 3.4 | 5.9 | 5834.2 | 97.02 | 94.34 | 100.00 | 94.34 | 0 | 0 | 0 | 2252.0 | 7827.7 | 35.35 | 5.1 | 100.00 |
+| t3 | None | v6 | 3 | 3.4 | 5.5 | 5837.7 | 97.02 | 94.34 | 100.00 | 94.34 | 0 | 0 | 0 | 2253.8 | 7829.4 | 35.35 | 5.2 | 100.00 |
+| t3 | None | v7 | 1 | 3.8 | 8.5 | 6589.8 | 96.75 | 93.82 | 100.00 | 94.43 | 0 | 0 | 0 | 2851.6 | 8554.1 | 30.69 | 6.9 | 100.00 |
+| t3 | None | v7 | 2 | 3.6 | 5.6 | 6585.9 | 96.75 | 93.82 | 100.00 | 94.43 | 0 | 0 | 0 | 2852.0 | 8555.5 | 30.69 | 5.3 | 100.00 |
+| t3 | None | v7 | 3 | 3.7 | 6.5 | 6589.0 | 96.75 | 93.82 | 100.00 | 94.43 | 0 | 0 | 0 | 2853.0 | 8555.5 | 30.69 | 5.5 | 100.00 |
+| t7 | bandwidth_2mbit | v5 | 1 | 62.5 | 108.3 | 116.8 | 100.00 | 100.00 | 100.00 | 33.33 | 0 | 0 | 0 | 60.7 | 106.8 | 100.00 | 108.3 | 100.00 |
+| t7 | bandwidth_2mbit | v5 | 2 | 63.2 | 108.3 | 116.4 | 100.00 | 100.00 | 100.00 | 33.33 | 0 | 0 | 0 | 60.8 | 106.0 | 100.00 | 108.6 | 100.00 |
+| t7 | bandwidth_2mbit | v5 | 3 | 62.7 | 108.5 | 116.7 | 100.00 | 100.00 | 100.00 | 33.33 | 0 | 0 | 0 | 61.8 | 107.0 | 100.00 | 108.7 | 100.00 |
+| t7 | bandwidth_2mbit | v6 | 1 | 20.1 | 38.9 | 53.7 | 100.00 | 100.00 | 100.00 | 33.33 | 0 | 0 | 0 | 29.6 | 47.0 | 100.00 | 38.8 | 100.00 |
+| t7 | bandwidth_2mbit | v6 | 2 | 20.3 | 38.9 | 53.8 | 100.00 | 100.00 | 100.00 | 33.33 | 0 | 0 | 0 | 29.5 | 46.6 | 100.00 | 38.8 | 100.00 |
+| t7 | bandwidth_2mbit | v6 | 3 | 20.1 | 39.0 | 53.5 | 100.00 | 100.00 | 100.00 | 33.33 | 0 | 0 | 0 | 29.6 | 46.5 | 100.00 | 38.8 | 100.00 |
+| t7 | bandwidth_2mbit | v7 | 1 | 21.4 | 43.8 | 6111.5 | 96.89 | 94.08 | 100.00 | 94.39 | 0 | 0 | 0 | 2590.6 | 8166.6 | 33.00 | 40.5 | 100.00 |
+| t7 | bandwidth_2mbit | v7 | 2 | 21.5 | 43.7 | 6106.3 | 96.89 | 94.08 | 100.00 | 94.39 | 0 | 0 | 0 | 2588.4 | 8163.8 | 33.00 | 40.4 | 100.00 |
+| t7 | bandwidth_2mbit | v7 | 3 | 21.5 | 43.5 | 6111.8 | 96.89 | 94.08 | 100.00 | 94.39 | 0 | 0 | 0 | 2590.0 | 8167.7 | 33.00 | 40.3 | 100.00 |
+| t11 | delay_100ms | v5 | 1 | 253.1 | 319.6 | 341.8 | 99.93 | 99.95 | 100.00 | 33.59 | 0 | 0 | 0 | 254.4 | 319.4 | 99.35 | 319.6 | 100.00 |
+| t11 | delay_100ms | v5 | 2 | 252.0 | 318.3 | 340.5 | 99.97 | 99.97 | 100.00 | 33.54 | 0 | 0 | 0 | 252.9 | 317.5 | 99.74 | 318.4 | 100.00 |
+| t11 | delay_100ms | v5 | 3 | 253.4 | 319.4 | 339.6 | 100.00 | 100.00 | 100.00 | 33.57 | 0 | 0 | 0 | 253.2 | 324.3 | 100.00 | 318.8 | 100.00 |
+| t11 | delay_100ms | v6 | 1 | 206.6 | 254.8 | 274.9 | 99.97 | 99.97 | 100.00 | 33.57 | 0 | 0 | 0 | 208.0 | 256.9 | 99.74 | 254.7 | 100.00 |
+| t11 | delay_100ms | v6 | 2 | 202.9 | 248.4 | 266.9 | 100.00 | 100.00 | 100.00 | 33.51 | 0 | 0 | 0 | 204.1 | 248.3 | 100.00 | 248.4 | 100.00 |
+| t11 | delay_100ms | v6 | 3 | 203.7 | 248.8 | 267.8 | 100.00 | 100.00 | 100.00 | 33.50 | 0 | 0 | 0 | 203.7 | 251.2 | 100.00 | 248.6 | 100.00 |
+| t11 | delay_100ms | v7 | 1 | 203.9 | 259.9 | 6427.4 | 96.83 | 94.03 | 100.00 | 94.39 | 0 | 0 | 0 | 2753.2 | 8447.9 | 31.84 | 248.5 | 100.00 |
+| t11 | delay_100ms | v7 | 2 | 203.1 | 263.9 | 6543.1 | 96.73 | 93.86 | 100.00 | 94.42 | 0 | 0 | 0 | 3017.5 | 8679.4 | 30.19 | 249.5 | 100.00 |
+| t11 | delay_100ms | v7 | 3 | 202.3 | 264.8 | 6501.1 | 96.79 | 93.95 | 100.00 | 94.40 | 0 | 0 | 0 | 2777.9 | 8471.9 | 31.11 | 250.7 | 100.00 |
+| t15 | delay_loss | v5 | 1 | 301.5 | 532.6 | 726.0 | 93.48 | 93.43 | 100.00 | 33.36 | 0 | 0 | 0 | 297.9 | 558.3 | 92.50 | 529.9 | 93.59 |
+| t15 | delay_loss | v5 | 2 | 296.1 | 513.1 | 694.5 | 94.45 | 94.45 | 100.00 | 33.35 | 0 | 0 | 0 | 296.5 | 501.4 | 94.88 | 513.1 | 94.40 |
+| t15 | delay_loss | v5 | 3 | 303.9 | 712.2 | 1052.1 | 89.87 | 89.87 | 100.00 | 33.35 | 0 | 0 | 0 | 309.0 | 756.7 | 88.03 | 705.8 | 90.08 |
+| t15 | delay_loss | v6 | 1 | 253.0 | 708.7 | 892.0 | 87.75 | 87.74 | 100.00 | 33.36 | 0 | 0 | 0 | 260.3 | 741.7 | 84.12 | 706.7 | 88.15 |
+| t15 | delay_loss | v6 | 2 | 244.4 | 530.3 | 804.2 | 93.24 | 93.24 | 100.00 | 33.36 | 0 | 0 | 0 | 249.4 | 555.8 | 91.59 | 528.1 | 93.42 |
+| t15 | delay_loss | v6 | 3 | 259.4 | 686.5 | 995.8 | 89.05 | 89.03 | 100.00 | 33.36 | 0 | 0 | 0 | 263.6 | 727.7 | 87.50 | 678.5 | 89.22 |
+| t15 | delay_loss | v7 | 1 | 254.3 | 907.8 | 7066.6 | 89.95 | 85.84 | 100.00 | 76.13 | 0 | 0 | 0 | 2724.9 | 8836.8 | 29.53 | 562.9 | 93.64 |
+| t15 | delay_loss | v7 | 2 | 260.2 | 819.9 | 7144.8 | 88.23 | 81.50 | 99.93 | 79.17 | 0 | 0 | 0 | 3083.2 | 8782.1 | 23.40 | 563.0 | 92.09 |
+| t15 | delay_loss | v7 | 3 | 253.8 | 646.2 | 6895.2 | 91.72 | 88.30 | 100.00 | 85.65 | 0 | 0 | 0 | 3056.9 | 8738.2 | 27.61 | 492.6 | 95.21 |
+| t19 | loss_3pct | v5 | 1 | 34.7 | 207.7 | 5488.2 | 96.01 | 96.61 | 100.00 | 41.81 | 0 | 0 | 0 | 93.8 | 6739.2 | 58.03 | 98.8 | 99.99 |
+| t19 | loss_3pct | v5 | 2 | 34.2 | 98.9 | 4892.9 | 96.41 | 97.04 | 100.00 | 40.69 | 0 | 0 | 0 | 83.5 | 6494.0 | 62.42 | 93.2 | 100.00 |
+| t19 | loss_3pct | v5 | 3 | 32.7 | 226.3 | 3822.4 | 97.26 | 97.64 | 100.00 | 42.06 | 0 | 0 | 0 | 79.2 | 5834.9 | 69.49 | 98.0 | 100.00 |
+| t19 | loss_3pct | v6 | 1 | 3.8 | 440.0 | 6338.0 | 95.00 | 95.74 | 100.00 | 42.14 | 0 | 0 | 0 | 584.0 | 7353.0 | 49.04 | 6.3 | 99.95 |
+| t19 | loss_3pct | v6 | 2 | 3.5 | 8.0 | 3334.0 | 97.19 | 97.61 | 100.00 | 41.90 | 0 | 0 | 0 | 4.6 | 5254.4 | 69.05 | 5.9 | 100.00 |
+| t19 | loss_3pct | v6 | 3 | 3.2 | 217.1 | 4830.9 | 96.59 | 96.97 | 100.00 | 43.03 | 0 | 0 | 0 | 4.8 | 6593.0 | 62.34 | 5.6 | 99.99 |
+| t19 | loss_3pct | v7 | 1 | 4.1 | 10.6 | 6553.0 | 96.65 | 93.82 | 100.00 | 91.66 | 0 | 0 | 0 | 2802.6 | 8352.3 | 30.69 | 7.3 | 100.00 |
+| t19 | loss_3pct | v7 | 2 | 4.1 | 9.5 | 6553.8 | 96.47 | 93.53 | 100.00 | 90.90 | 0 | 0 | 0 | 3087.3 | 8356.7 | 28.43 | 6.1 | 99.99 |
+| t19 | loss_3pct | v7 | 3 | 3.9 | 7.5 | 6384.0 | 96.64 | 93.80 | 100.00 | 92.03 | 0 | 0 | 0 | 2853.2 | 8356.7 | 30.69 | 5.8 | 99.98 |
+| t23 | reorder | v5 | 1 | 43.2 | 45.2 | 5874.5 | 97.04 | 94.37 | 100.00 | 94.34 | 0 | 0 | 0 | 2291.2 | 7841.9 | 35.59 | 44.6 | 100.00 |
+| t23 | reorder | v5 | 2 | 43.3 | 45.7 | 5876.0 | 97.02 | 94.34 | 100.00 | 94.34 | 0 | 0 | 0 | 2289.0 | 7865.4 | 35.35 | 44.7 | 100.00 |
+| t23 | reorder | v5 | 3 | 43.2 | 45.9 | 5880.2 | 97.02 | 94.34 | 100.00 | 94.34 | 0 | 0 | 0 | 2293.9 | 7871.9 | 35.35 | 44.6 | 100.00 |
+| t23 | reorder | v6 | 1 | 43.4 | 45.3 | 5876.8 | 97.02 | 94.34 | 100.00 | 94.34 | 0 | 0 | 0 | 2292.6 | 7859.1 | 35.35 | 44.9 | 100.00 |
+| t23 | reorder | v6 | 2 | 43.6 | 45.9 | 5881.3 | 97.02 | 94.34 | 100.00 | 94.34 | 0 | 0 | 0 | 2295.1 | 7871.2 | 35.35 | 45.2 | 100.00 |
+| t23 | reorder | v6 | 3 | 43.5 | 45.8 | 5878.9 | 97.02 | 94.34 | 100.00 | 94.34 | 0 | 0 | 0 | 2293.9 | 7871.5 | 35.35 | 45.1 | 100.00 |
+| t23 | reorder | v7 | 1 | 44.0 | 47.9 | 6634.2 | 96.75 | 93.82 | 100.00 | 94.43 | 0 | 0 | 0 | 2892.7 | 8596.9 | 30.69 | 46.2 | 100.00 |
+| t23 | reorder | v7 | 2 | 43.8 | 47.8 | 6627.2 | 96.75 | 93.82 | 100.00 | 94.43 | 0 | 0 | 0 | 2897.2 | 8594.5 | 30.69 | 45.8 | 100.00 |
+| t23 | reorder | v7 | 3 | 43.9 | 48.4 | 6630.6 | 96.75 | 93.82 | 100.00 | 94.43 | 0 | 0 | 0 | 2892.4 | 8595.0 | 30.69 | 46.8 | 100.00 |
 
-Median P95 vs no-impairment baseline (v4): bandwidth_2mbit 16×, delay_100ms 47×, delay_loss 79×, loss_3pct 31×, reorder 7×
+Median P95 vs no-impairment baseline (v5): bandwidth_2mbit 16×, delay_100ms 47×, delay_loss 79×, loss_3pct 31×, reorder 7×
 
-Median P95 vs no-impairment baseline (v5): bandwidth_2mbit 7×, delay_100ms 45×, delay_loss 124×, loss_3pct 39×, reorder 8×
+Median P95 vs no-impairment baseline (v6): bandwidth_2mbit 7×, delay_100ms 45×, delay_loss 124×, loss_3pct 39×, reorder 8×
+
+Median P95 vs no-impairment baseline (v7): bandwidth_2mbit 7×, delay_100ms 41×, delay_loss 127×, loss_3pct 1×, reorder 7×
 
 ## T4 Reconnect (100 clients, 60 s, 20% drop @15 s for 5 s)
 
 | Test | Network | Version | Run | P50 ms | P95 ms | P99 ms | Fresh % | Fresh final % | Final complete % | Update coverage % | Dup | Stale | Conn err | Recovery P50 ms | Recovery P95 ms | Recovered items |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| t4 | None | v4 | 1 | 2.9 | 4.7 | 5.4 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 2.1 | 2.3 | 140 |
-| t4 | None | v4 | 2 | 3.0 | 4.8 | 5.4 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 1.9 | 2.1 | 140 |
-| t4 | None | v4 | 3 | 3.0 | 4.8 | 5.4 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 1.9 | 2.0 | 140 |
-| t4 | None | v5 | 1 | 3.1 | 5.2 | 6.3 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 1.6 | 1.8 | 140 |
-| t4 | None | v5 | 2 | 3.0 | 4.8 | 5.4 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 1.9 | 2.0 | 140 |
-| t4 | None | v5 | 3 | 3.1 | 5.1 | 6.2 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 2.4 | 2.5 | 140 |
-| t8 | bandwidth_2mbit | v4 | 1 | 38.7 | 106.2 | 114.7 | 100.00 | 98.42 | 100.00 | 41.53 | 0 | 0 | 0 | 1.6 | 12.3 | 120 |
-| t8 | bandwidth_2mbit | v4 | 2 | 38.2 | 105.8 | 114.0 | 100.00 | 98.42 | 100.00 | 41.54 | 0 | 0 | 0 | 4.2 | 14.5 | 120 |
-| t8 | bandwidth_2mbit | v4 | 3 | 38.2 | 106.0 | 114.7 | 100.00 | 98.42 | 100.00 | 41.55 | 0 | 0 | 0 | 8.8 | 26.8 | 120 |
-| t8 | bandwidth_2mbit | v5 | 1 | 13.8 | 37.9 | 52.4 | 100.00 | 98.42 | 100.00 | 41.43 | 0 | 0 | 0 | 5.1 | 19.7 | 120 |
-| t8 | bandwidth_2mbit | v5 | 2 | 14.0 | 38.2 | 52.7 | 100.00 | 98.42 | 100.00 | 41.43 | 0 | 0 | 0 | 7.9 | 19.6 | 120 |
-| t8 | bandwidth_2mbit | v5 | 3 | 14.2 | 38.4 | 52.5 | 100.00 | 98.42 | 100.00 | 41.42 | 0 | 0 | 0 | 10.8 | 23.9 | 120 |
-| t12 | delay_100ms | v4 | 1 | 251.5 | 319.3 | 342.6 | 100.00 | 98.16 | 100.00 | 32.90 | 0 | 0 | 0 | 202.0 | 252.1 | 140 |
-| t12 | delay_100ms | v4 | 2 | 250.1 | 316.3 | 341.3 | 100.00 | 98.16 | 100.00 | 32.96 | 0 | 0 | 0 | 199.8 | 249.5 | 140 |
-| t12 | delay_100ms | v4 | 3 | 247.8 | 315.8 | 341.1 | 100.00 | 98.16 | 100.00 | 32.90 | 0 | 0 | 0 | 204.5 | 236.0 | 140 |
-| t12 | delay_100ms | v5 | 1 | 201.9 | 249.2 | 267.7 | 100.00 | 98.16 | 100.00 | 32.95 | 0 | 0 | 0 | 197.6 | 230.7 | 140 |
-| t12 | delay_100ms | v5 | 2 | 204.1 | 250.4 | 268.4 | 100.00 | 98.16 | 100.00 | 32.90 | 0 | 0 | 0 | 210.7 | 239.7 | 140 |
-| t12 | delay_100ms | v5 | 3 | 202.6 | 248.9 | 267.7 | 100.00 | 98.16 | 100.00 | 32.90 | 0 | 0 | 0 | 209.1 | 263.4 | 140 |
-| t16 | delay_loss | v4 | 1 | 301.3 | 628.9 | 840.2 | 90.11 | 88.30 | 100.00 | 32.68 | 0 | 0 | 0 | 245.9 | 362.9 | 163 |
-| t16 | delay_loss | v4 | 2 | 308.6 | 929.2 | 1206.4 | 82.36 | 80.20 | 99.34 | 32.46 | 0 | 0 | 0 | 263.5 | 338.9 | 156 |
-| t16 | delay_loss | v4 | 3 | 302.2 | 815.4 | 1085.1 | 83.08 | 81.04 | 100.00 | 32.56 | 0 | 0 | 0 | 251.3 | 291.0 | 187 |
-| t16 | delay_loss | v5 | 1 | 251.1 | 624.6 | 748.0 | 91.35 | 89.45 | 100.00 | 32.62 | 0 | 0 | 0 | 235.2 | 906.5 | 173 |
-| t16 | delay_loss | v5 | 2 | 260.5 | 718.5 | 1035.6 | 89.08 | 86.93 | 100.00 | 32.54 | 0 | 0 | 0 | 258.6 | 583.5 | 189 |
-| t16 | delay_loss | v5 | 3 | 252.2 | 759.0 | 1419.6 | 87.66 | 85.89 | 100.00 | 32.66 | 0 | 0 | 0 | 240.0 | 373.0 | 163 |
-| t20 | loss_3pct | v4 | 1 | 24.4 | 97.0 | 257.0 | 99.98 | 98.38 | 100.00 | 42.48 | 0 | 0 | 0 | 0.5 | 0.8 | 127 |
-| t20 | loss_3pct | v4 | 2 | 24.0 | 96.4 | 267.6 | 100.00 | 98.39 | 100.00 | 43.02 | 0 | 0 | 0 | 0.3 | 0.6 | 126 |
-| t20 | loss_3pct | v4 | 3 | 28.1 | 95.2 | 211.3 | 99.98 | 98.37 | 100.00 | 41.64 | 0 | 0 | 0 | 0.5 | 203.7 | 130 |
-| t20 | loss_3pct | v5 | 1 | 3.0 | 5.4 | 228.2 | 99.99 | 98.58 | 100.00 | 42.26 | 0 | 0 | 0 | 1.6 | 1.7 | 124 |
-| t20 | loss_3pct | v5 | 2 | 2.8 | 13.7 | 213.6 | 99.98 | 98.55 | 100.00 | 42.95 | 0 | 0 | 0 | 1.4 | 1.6 | 126 |
-| t20 | loss_3pct | v5 | 3 | 2.9 | 5.3 | 207.7 | 99.99 | 98.64 | 100.00 | 42.46 | 0 | 0 | 0 | 2.0 | 12.3 | 122 |
-| t24 | reorder | v4 | 1 | 43.0 | 44.6 | 45.2 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 40.4 | 40.5 | 120 |
-| t24 | reorder | v4 | 2 | 42.9 | 44.6 | 45.2 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 40.2 | 40.6 | 120 |
-| t24 | reorder | v4 | 3 | 42.9 | 44.5 | 45.0 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 40.3 | 40.7 | 120 |
-| t24 | reorder | v5 | 1 | 43.3 | 45.1 | 45.5 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 40.4 | 40.9 | 120 |
-| t24 | reorder | v5 | 2 | 43.3 | 45.1 | 45.7 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 40.3 | 40.9 | 120 |
-| t24 | reorder | v5 | 3 | 43.0 | 44.9 | 45.7 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 40.3 | 40.7 | 120 |
+| t4 | None | v5 | 1 | 2.9 | 4.7 | 5.4 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 2.1 | 2.3 | 140 |
+| t4 | None | v5 | 2 | 3.0 | 4.8 | 5.4 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 1.9 | 2.1 | 140 |
+| t4 | None | v5 | 3 | 3.0 | 4.8 | 5.4 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 1.9 | 2.0 | 140 |
+| t4 | None | v6 | 1 | 3.1 | 5.2 | 6.3 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 1.6 | 1.8 | 140 |
+| t4 | None | v6 | 2 | 3.0 | 4.8 | 5.4 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 1.9 | 2.0 | 140 |
+| t4 | None | v6 | 3 | 3.1 | 5.1 | 6.2 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 2.4 | 2.5 | 140 |
+| t4 | None | v7 | 1 | 3.4 | 5.4 | 6.4 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 2.2 | 2.4 | 140 |
+| t4 | None | v7 | 2 | 3.4 | 5.4 | 7.2 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 2.7 | 3.0 | 140 |
+| t4 | None | v7 | 3 | 3.6 | 6.6 | 8.6 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 2.9 | 3.1 | 140 |
+| t8 | bandwidth_2mbit | v5 | 1 | 38.7 | 106.2 | 114.7 | 100.00 | 98.42 | 100.00 | 41.53 | 0 | 0 | 0 | 1.6 | 12.3 | 120 |
+| t8 | bandwidth_2mbit | v5 | 2 | 38.2 | 105.8 | 114.0 | 100.00 | 98.42 | 100.00 | 41.54 | 0 | 0 | 0 | 4.2 | 14.5 | 120 |
+| t8 | bandwidth_2mbit | v5 | 3 | 38.2 | 106.0 | 114.7 | 100.00 | 98.42 | 100.00 | 41.55 | 0 | 0 | 0 | 8.8 | 26.8 | 120 |
+| t8 | bandwidth_2mbit | v6 | 1 | 13.8 | 37.9 | 52.4 | 100.00 | 98.42 | 100.00 | 41.43 | 0 | 0 | 0 | 5.1 | 19.7 | 120 |
+| t8 | bandwidth_2mbit | v6 | 2 | 14.0 | 38.2 | 52.7 | 100.00 | 98.42 | 100.00 | 41.43 | 0 | 0 | 0 | 7.9 | 19.6 | 120 |
+| t8 | bandwidth_2mbit | v6 | 3 | 14.2 | 38.4 | 52.5 | 100.00 | 98.42 | 100.00 | 41.42 | 0 | 0 | 0 | 10.8 | 23.9 | 120 |
+| t8 | bandwidth_2mbit | v7 | 1 | 21.8 | 42.4 | 46.5 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 55.0 | 60.8 | 136 |
+| t8 | bandwidth_2mbit | v7 | 2 | 21.9 | 42.4 | 47.0 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 45.7 | 48.0 | 133 |
+| t8 | bandwidth_2mbit | v7 | 3 | 21.8 | 42.6 | 47.2 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 46.1 | 47.9 | 133 |
+| t12 | delay_100ms | v5 | 1 | 251.5 | 319.3 | 342.6 | 100.00 | 98.16 | 100.00 | 32.90 | 0 | 0 | 0 | 202.0 | 252.1 | 140 |
+| t12 | delay_100ms | v5 | 2 | 250.1 | 316.3 | 341.3 | 100.00 | 98.16 | 100.00 | 32.96 | 0 | 0 | 0 | 199.8 | 249.5 | 140 |
+| t12 | delay_100ms | v5 | 3 | 247.8 | 315.8 | 341.1 | 100.00 | 98.16 | 100.00 | 32.90 | 0 | 0 | 0 | 204.5 | 236.0 | 140 |
+| t12 | delay_100ms | v6 | 1 | 201.9 | 249.2 | 267.7 | 100.00 | 98.16 | 100.00 | 32.95 | 0 | 0 | 0 | 197.6 | 230.7 | 140 |
+| t12 | delay_100ms | v6 | 2 | 204.1 | 250.4 | 268.4 | 100.00 | 98.16 | 100.00 | 32.90 | 0 | 0 | 0 | 210.7 | 239.7 | 140 |
+| t12 | delay_100ms | v6 | 3 | 202.6 | 248.9 | 267.7 | 100.00 | 98.16 | 100.00 | 32.90 | 0 | 0 | 0 | 209.1 | 263.4 | 140 |
+| t12 | delay_100ms | v7 | 1 | 203.6 | 252.3 | 273.2 | 100.00 | 98.16 | 100.00 | 97.98 | 0 | 0 | 0 | 195.4 | 232.4 | 160 |
+| t12 | delay_100ms | v7 | 2 | 203.5 | 249.7 | 269.3 | 100.00 | 98.14 | 100.00 | 97.99 | 0 | 0 | 0 | 191.2 | 217.1 | 159 |
+| t12 | delay_100ms | v7 | 3 | 202.1 | 248.9 | 268.3 | 100.00 | 98.16 | 100.00 | 97.99 | 0 | 0 | 0 | 191.0 | 247.3 | 159 |
+| t16 | delay_loss | v5 | 1 | 301.3 | 628.9 | 840.2 | 90.11 | 88.30 | 100.00 | 32.68 | 0 | 0 | 0 | 245.9 | 362.9 | 163 |
+| t16 | delay_loss | v5 | 2 | 308.6 | 929.2 | 1206.4 | 82.36 | 80.20 | 99.34 | 32.46 | 0 | 0 | 0 | 263.5 | 338.9 | 156 |
+| t16 | delay_loss | v5 | 3 | 302.2 | 815.4 | 1085.1 | 83.08 | 81.04 | 100.00 | 32.56 | 0 | 0 | 0 | 251.3 | 291.0 | 187 |
+| t16 | delay_loss | v6 | 1 | 251.1 | 624.6 | 748.0 | 91.35 | 89.45 | 100.00 | 32.62 | 0 | 0 | 0 | 235.2 | 906.5 | 173 |
+| t16 | delay_loss | v6 | 2 | 260.5 | 718.5 | 1035.6 | 89.08 | 86.93 | 100.00 | 32.54 | 0 | 0 | 0 | 258.6 | 583.5 | 189 |
+| t16 | delay_loss | v6 | 3 | 252.2 | 759.0 | 1419.6 | 87.66 | 85.89 | 100.00 | 32.66 | 0 | 0 | 0 | 240.0 | 373.0 | 163 |
+| t16 | delay_loss | v7 | 1 | 257.4 | 558.1 | 788.8 | 93.18 | 87.17 | 100.00 | 85.68 | 0 | 0 | 0 | 228.6 | 278.8 | 165 |
+| t16 | delay_loss | v7 | 2 | 254.0 | 498.2 | 714.5 | 95.07 | 91.34 | 100.00 | 89.60 | 0 | 0 | 0 | 240.8 | 558.5 | 163 |
+| t16 | delay_loss | v7 | 3 | 251.3 | 509.0 | 829.6 | 94.74 | 91.09 | 99.99 | 85.50 | 0 | 0 | 0 | 241.7 | 341.4 | 162 |
+| t20 | loss_3pct | v5 | 1 | 24.4 | 97.0 | 257.0 | 99.98 | 98.38 | 100.00 | 42.48 | 0 | 0 | 0 | 0.5 | 0.8 | 127 |
+| t20 | loss_3pct | v5 | 2 | 24.0 | 96.4 | 267.6 | 100.00 | 98.39 | 100.00 | 43.02 | 0 | 0 | 0 | 0.3 | 0.6 | 126 |
+| t20 | loss_3pct | v5 | 3 | 28.1 | 95.2 | 211.3 | 99.98 | 98.37 | 100.00 | 41.64 | 0 | 0 | 0 | 0.5 | 203.7 | 130 |
+| t20 | loss_3pct | v6 | 1 | 3.0 | 5.4 | 228.2 | 99.99 | 98.58 | 100.00 | 42.26 | 0 | 0 | 0 | 1.6 | 1.7 | 124 |
+| t20 | loss_3pct | v6 | 2 | 2.8 | 13.7 | 213.6 | 99.98 | 98.55 | 100.00 | 42.95 | 0 | 0 | 0 | 1.4 | 1.6 | 126 |
+| t20 | loss_3pct | v6 | 3 | 2.9 | 5.3 | 207.7 | 99.99 | 98.64 | 100.00 | 42.46 | 0 | 0 | 0 | 2.0 | 12.3 | 122 |
+| t20 | loss_3pct | v7 | 1 | 3.5 | 7.7 | 210.0 | 100.00 | 98.39 | 100.00 | 96.44 | 0 | 0 | 0 | 2.8 | 4.3 | 142 |
+| t20 | loss_3pct | v7 | 2 | 3.5 | 6.3 | 10.2 | 99.99 | 98.34 | 100.00 | 96.21 | 0 | 0 | 0 | 2.0 | 2.2 | 146 |
+| t20 | loss_3pct | v7 | 3 | 3.5 | 5.9 | 9.0 | 99.99 | 98.34 | 100.00 | 95.54 | 0 | 0 | 0 | 2.5 | 23.3 | 145 |
+| t24 | reorder | v5 | 1 | 43.0 | 44.6 | 45.2 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 40.4 | 40.5 | 120 |
+| t24 | reorder | v5 | 2 | 42.9 | 44.6 | 45.2 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 40.2 | 40.6 | 120 |
+| t24 | reorder | v5 | 3 | 42.9 | 44.5 | 45.0 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 40.3 | 40.7 | 120 |
+| t24 | reorder | v6 | 1 | 43.3 | 45.1 | 45.5 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 40.4 | 40.9 | 120 |
+| t24 | reorder | v6 | 2 | 43.3 | 45.1 | 45.7 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 40.3 | 40.9 | 120 |
+| t24 | reorder | v6 | 3 | 43.0 | 44.9 | 45.7 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 40.3 | 40.7 | 120 |
+| t24 | reorder | v7 | 1 | 43.5 | 46.0 | 47.1 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 40.3 | 40.6 | 120 |
+| t24 | reorder | v7 | 2 | 43.4 | 45.6 | 47.6 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 40.3 | 40.6 | 120 |
+| t24 | reorder | v7 | 3 | 43.5 | 45.8 | 48.0 | 100.00 | 98.42 | 100.00 | 98.25 | 0 | 0 | 0 | 40.4 | 40.6 | 120 |
 
-Median P95 vs no-impairment baseline (v4): bandwidth_2mbit 22×, delay_100ms 66×, delay_loss 169×, loss_3pct 20×, reorder 9×
+Median P95 vs no-impairment baseline (v5): bandwidth_2mbit 22×, delay_100ms 66×, delay_loss 169×, loss_3pct 20×, reorder 9×
 
-Median P95 vs no-impairment baseline (v5): bandwidth_2mbit 7×, delay_100ms 49×, delay_loss 140×, loss_3pct 1×, reorder 9×
+Median P95 vs no-impairment baseline (v6): bandwidth_2mbit 7×, delay_100ms 49×, delay_loss 140×, loss_3pct 1×, reorder 9×
 
+Median P95 vs no-impairment baseline (v7): bandwidth_2mbit 8×, delay_100ms 46×, delay_loss 94×, loss_3pct 1×, reorder 8×
