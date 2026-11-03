@@ -160,17 +160,9 @@ class Client:
         if not self.lagging:
             return self._next_fifo(store)
 
-        # 2. Lag mode, finals first: one CAPTION_UPDATE each, oldest first, never paced.
-        if self.final_backlog(store):
-            missing = store.finals_after_segment(self.last_final_sent)
-            if missing:
-                e = missing[0]
-                self.last_final_sent = e.segment
-                self._forget_covered_revs()
-                self.lag_sent += 1
-                return e.raw
-
-        # 3. Caught up? Return to full updates, seeding the segments in progress.
+        # 2. Caught up? Return to full updates, seeding the segments in progress.
+        # The exit check comes before the finals
+        # Behind them, a client that got a final more often than LAG_PROV_GAP could never leave
         now = time.monotonic()
         if self._caught_up(now):
             self.lagging = False
@@ -179,6 +171,16 @@ class Client:
             for e in store.active_after(self.last_final_sent):
                 self.dirty[e.segment] = now
             return self._next_fifo(store)
+
+        # 3. Lag mode, finals first: one CAPTION_UPDATE each, oldest first, never paced.
+        if self.final_backlog(store):
+            missing = store.finals_after_segment(self.last_final_sent)
+            if missing:
+                e = missing[0]
+                self.last_final_sent = e.segment
+                self._forget_covered_revs()
+                self.lag_sent += 1
+                return e.raw
 
         # 4. Lag mode, provisional: only the NEWEST revision, only if the client lacks it.
         e = store.newest_active_after(self.last_final_sent)
