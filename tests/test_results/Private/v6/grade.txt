@@ -1,0 +1,37 @@
+
+=== Rough hidden-performance estimate (spec 13.1) ===
+NOT the real grader: thresholds are guesses; each check scores linearly from 'bad' to 'good'.
+Tests: delay=tests/test_results/Private/v6/p1, delay_loss=tests/test_results/Private/v6/p2, slow30=tests/test_results/Private/v6/p3, slow50_500ms=tests/test_results/Private/v6/p4, bw300=tests/test_results/Private/v6/p5, recover=tests/test_results/Private/v6/p6, reconnect=tests/test_results/Private/v6/p7, scale300=tests/test_results/Private/v6/p8, scale500=tests/test_results/Private/v6/p9, fast=tests/test_results/Private/v6/p10, combo=tests/test_results/Private/v6/p11
+
+Correctness and invariants          8.0 / 8
+     4.0 / 4  worst final completeness %                      100.00   (0 at 99, full at 100)
+     2.0 / 2  stale + duplicate messages                        0.00   (0 at 1, full at 0)
+     1.0 / 1  connection errors                                 0.00   (0 at 1, full at 0)
+     1.0 / 1  server RSS growth after setup, MB                 0.29   (0 at 100, full at 20)
+
+Normal coverage and freshness       4.0 / 4
+     2.0 / 2  update coverage % (no impairment)               100.00   (0 at 90, full at 99.5)
+     2.0 / 2  fresh % (no impairment)                         100.00   (0 at 90, full at 99)
+
+Delay/loss tail freshness           1.2 / 2
+     0.6 / 1  fresh % under delay/loss                         91.34   (0 at 80, full at 98)
+     0.6 / 1  P95 under delay/loss, ms                        696.27   (0 at 1000, full at 450)
+
+Slow-reader challenge               4.6 / 6
+     3.0 / 3  normal clients' fresh % beside slow readers     100.00   (0 at 85, full at 98)
+     0.4 / 1  slow clients' fresh-final %                      43.42   (0 at 20, full at 80)
+     0.3 / 1  slow clients' fresh % (all updates)              35.35   (0 at 20, full at 80)
+     1.0 / 1  server RSS growth with slow readers, MB           0.05   (0 at 100, full at 20)
+
+Constrained-bandwidth challenge     6.0 / 6
+     3.0 / 3  fresh-final % at 2 Mbit, 300 clients            100.00   (0 at 30, full at 90)
+     3.0 / 3  fresh % at 2 Mbit, 300 clients                  100.00   (0 at 80, full at 98)
+
+Reconnect and catch-up              3.0 / 4
+     1.0 / 1  recovery P95, ms                                  4.25   (0 at 2000, full at 200)
+     0.0 / 1  coverage % once the bandwidth limit lifts        33.33   (0 at 70, full at 98)
+     1.0 / 1  final completeness % with reconnects            100.00   (0 at 99, full at 100)
+     1.0 / 1  fresh % with reconnects                         100.00   (0 at 90, full at 98)
+
+Total: 26.8 / 30 of the checks that ran
+Correctness gate: worst final completeness 100.00% -> no cap  =>  ~26.8 / 30

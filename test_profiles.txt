@@ -1,3 +1,3 @@
-t1-t4: none
-t1-t4: none
-t5-t8: bandwidth_2mbit
+tests/test_results/public/v6/t1-t4: none
+tests/test_results/public/v6/t5-t8: bandwidth_2mbit
+tests/test_results/public/v6/t9-t12: delay_100ms
