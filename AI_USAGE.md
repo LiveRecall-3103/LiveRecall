@@ -12,30 +12,27 @@ Describe one suggestion that materially helped the project and how you verified 
 
 Include a short generated suggestion/code fragment or precise description, explain the problem, and describe your correction.
 
-Solution that AI suggested is to add a fixed pinger every 2 seconds.
-```
-LAG_PING_GAP = 2.0   # s: lagging clients ping at most this often (saves bandwidth for finals)
+**Suggestion.** Limit pings for lagging clients by time: at most one ping every 2 s.
 
-async def unicast(client: Client) -> None:
-    last_send = 0.0
-    last_ping = 0.0                                   # new
-    ...
-                t0 = time.monotonic()
-                await client.ws.send(msg)
-                last_send = t0
-                if PING_FLOW_CONTROL and (not client.lagging or t0 - last_ping >= LAG_PING_GAP):
-                    last_ping = t0
-                    timed_out = False
-                    pong = await client.ws.ping()
-                    try:
-                        await asyncio.wait_for(asyncio.shield(pong), timeout=PONG_WAIT)
-                    except asyncio.TimeoutError:
-                        timed_out = True
-                        pong.add_done_callback(_quiet)
-                    now = time.monotonic()
-                    client.on_pong(now, now - t0, timed_out) 
+```python
+LAG_PING_GAP = 2.0
+...
+await client.ws.send(msg)
+if not client.lagging or t0 - last_ping >= LAG_PING_GAP:
+    last_ping = t0
+    pong = await client.ws.ping()   # sender waits for the pong (up to PONG_WAIT = 1 s)
 ```
-This is not good because the timer will send regardless of how slow the bandwidth is. Suppose the bandwidth is so low that it can only support 1 message every 2 seconds, then the whole channel will be flooded with the ping messages only. A better way would be to send a ping after every 4 if the client is lagging, and send after every 1 packet for normal conditions. This would adapt to the network conditions.
+
+**Problem.** A time limit doesn't adapt to link speed. If the link carries one message every 2 s, the gap has always passed, so every message still gets a ping and the sender still waits on each pong. Lag mode saves nothing on the slow links it is meant for.
+
+**Correction.** Count messages instead of time: ping after every message normally, and after every 2nd message when lagging, so ping cost scales with what actually gets through.
+
+```python
+pkt_ctr += 1
+if client.lagging and pkt_ctr % PING_EVERY_N != 0:   # PING_EVERY_N = 2
+    continue                                         # skip this ping
+pong = await client.ws.ping()
+```
 
 ## Responsibility statement
 

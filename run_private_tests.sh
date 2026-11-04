@@ -1,27 +1,18 @@
 #!/usr/bin/env bash
-# Harder-than-public tests aimed at what the hidden evaluator may vary (spec section 10).
+# Harder tests aimed at what the hidden evaluator may vary (spec section 10).
 # Usage: [OUT=DIR] [SERVER=FILE] ./run_private_tests.sh START [TEST...]
-#   Runs SERVER (default "solution_server copy.py"). Results go to OUT, a path relative to the repo
-#   (default tests/test_results/Private/v5);
-#   same-named files there are overwritten.
-#   TEST = delay delay_loss slow30 slow50_500ms bw300 recover reconnect scale300 scale500 fast combo
-# Limits follow the instructor's clarification: a segment arrives every 0.75 s with 3 revisions, so
-# slow readers sit between 250 ms (all revisions) and 750 ms (finals only) per message, and bandwidth
-# carries finals but not every revision (300 clients: finals ~1.1 Mbit/s, full stream ~3.1 Mbit/s).
-# Every test must allow 100% final completeness. The client library holds ~16 unread messages before
-# any server can see a slow reader, so slow-ms stays <= 500: a 500 ms reader has ~20 reads to spare
-# in 60 s after that backlog, a 600 ms reader only ~4.
-#   default: all of them (~30 min). e.g. START=1 -> delay: p1, delay_loss: p2, ...
-# Each test runs 3 times (OUT/p<N>_run01..03.{csv,json}), samples server memory into
-# OUT/p<N>_run0X_rss.csv, prints medians, and saves its full output (including the server's
-# "lag entries" line) to OUT/p<N>.log. The stem -> test mapping is appended to private_profiles.txt.
-# Ends with a rough rubric-based mark estimate, also saved to OUT/grade.txt
-# (grade_private.py; re-run it any time to re-grade).
+#   START numbers the outputs (START=1 -> p1, p2, ...). TEST defaults to all (~30 min):
+#   delay delay_loss slow30 slow50_500ms bw300 recover reconnect scale300 scale500 fast combo
+#   SERVER defaults to solution_server.py, OUT to tests/test_results/Private/v6 (files overwritten).
+# Each test runs 3 times: OUT/p<N>_run0X.{csv,json}, memory in OUT/p<N>_run0X_rss.csv, log in
+# OUT/p<N>.log; stem -> test is appended to private_profiles.txt. Ends with a rough mark estimate
+# in OUT/grade.txt (re-run grade_private.py to re-grade).
+# Limits keep 100% finals possible: slow-ms <= 500, bandwidth fits finals but not every revision.
 set -euo pipefail
 cd "$(dirname "$0")"
-OUT=${OUT:-tests/test_results/Private/v5}
+OUT=${OUT:-tests/test_results/Private/v6}
 mkdir -p "$OUT"
-SERVER=${SERVER:-solution_server copy.py}
+SERVER=${SERVER:-solution_server.py}
 
 ALL="delay delay_loss slow30 slow50_500ms bw300 recover reconnect scale300 scale500 fast combo"
 n=${1:?usage: $0 START_NUMBER [TEST...]}

@@ -1,18 +1,13 @@
 #!/usr/bin/env bash
-# Run the public tests T1-T5 from docs/PUBLIC_TESTS.md, 3 runs each (run_demo.py restarts the
-# server for every run; report the median).
-# Usage: [OUT=DIR] [SERVER=FILE] [LIVERECALL_VERSION=N] ./run_public_tests.sh
-#   Runs SERVER (default "solution_server copy.py" as v5). Results go to OUT/tN_run0X.{csv,json}, a path
-#   relative to the repo (default tests/test_results/public/v5); same-named files there are overwritten.
-#   For v6: SERVER=solution_server.py OUT=tests/test_results/public/v6 ./run_public_tests.sh
-#   T5 applies the delay_loss profile to lo (needs sudo); impairment is always cleared afterwards.
+# Public tests T1-T5 (docs/PUBLIC_TESTS.md), 3 runs each.
+# Usage: [OUT=DIR] [SERVER=FILE] ./run_public_tests.sh
+#   SERVER defaults to solution_server.py, OUT to tests/test_results/public/v6 (files overwritten).
+#   T5 impairs lo with delay_loss (needs sudo); lo is always reset afterwards.
 set -euo pipefail
 cd "$(dirname "$0")"
-OUT=${OUT:-tests/test_results/public/v5}
+OUT=${OUT:-tests/test_results/public/v6}
 mkdir -p "$OUT"
-SERVER=${SERVER:-solution_server copy.py}
-# "solution_server copy.py" reads its version from config.py, which defaults to 6; the v6 file ignores it.
-export LIVERECALL_VERSION=${LIVERECALL_VERSION:-5}
+SERVER=${SERVER:-solution_server.py}
 
 demo() {  # STEM ARGS...: one test, 3 runs
   local stem=$1; shift
