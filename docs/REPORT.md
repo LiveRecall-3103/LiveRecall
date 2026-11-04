@@ -5,7 +5,8 @@ documentclass: article
 papersize: a4
 geometry: margin=0.7in
 fontsize: 10pt
-fontfamily: lmodern
+mainfont: Arial
+sansfont: Arial
 numbersections: true
 colorlinks: true
 secnumdepth: 2
@@ -13,7 +14,22 @@ header-includes: |
   \renewcommand{\familydefault}{\sfdefault}
   \newsavebox{\warnbox}
   \newcommand{\bwarn}{\par\medskip\begin{lrbox}{\warnbox}\begin{minipage}{\dimexpr\linewidth-25pt\relax}\color{black!50!black}}
-  \newcommand{\ewarn}{\end{minipage}\end{lrbox}\par\noindent\hbox{{\color{yellow}\vrule width 5pt}{\setlength{\fboxsep}{10pt}\colorbox{red!6}{\usebox{\warnbox}}}}\par\medskip}
+  \newcommand{\ewarn}{\end{minipage}\end{lrbox}\par\noindent\hbox{{\color{red}\vrule width 5pt}{\setlength{\fboxsep}{10pt}\colorbox{red!6}{\usebox{\warnbox}}}}\par\medskip}
+  \newcommand{\vtag}[2]{\colorbox{#1}{\textcolor{white}{\textbf{\scriptsize #2}}}}
+  \definecolor{vc0}{HTML}{7F7F7F}
+  \definecolor{vc1}{HTML}{8C564B}
+  \definecolor{vc2}{HTML}{D62728}
+  \definecolor{vc3}{HTML}{FF7F0E}
+  \definecolor{vc4}{HTML}{9467BD}
+  \definecolor{vc5}{HTML}{1F77B4}
+  \definecolor{vc6}{HTML}{2CA02C}
+  \newcommand{\vzero}{\vtag{vc0}{v0}}
+  \newcommand{\vone}{\vtag{vc1}{v1}}
+  \newcommand{\vtwo}{\vtag{vc2}{v2}}
+  \newcommand{\vthree}{\vtag{vc3}{v3}}
+  \newcommand{\vfour}{\vtag{vc4}{v4}}
+  \newcommand{\vfive}{\vtag{vc5}{v5}}
+  \newcommand{\vsix}{\vtag{vc6}{v6}}
 ---
 
 <!-- 
@@ -23,27 +39,28 @@ header-includes: |
 The report must include: architecture and protocol; revision/recovery semantics; backpressure/overload policy;public experiments; at least one before/after optimization comparison; P50/P95/P99/freshness/final-completeness results; discussion of failures and trade-offs; limitations; and a short future-work/FYP direction.
 
 -->
+
 # Architecture and Protocol
 
-Our project splits into two parts: the solution server and the client. The solution server has two main components: a `CaptionStore`, which holds the captions received from the caption server, and a list of `Client` objects, each holding a client's websocket connection and its send queue.
+Our system has two parts: the solution server (`solution_server.py`) and the browser client (`client/app.js`). The server has two main components: a `CaptionStore`, which holds the captions received from the caption source, and a set of `Client` objects, each holding one client's WebSocket connection and its send queue.
 
-Upon receiving the websocket initialized message, our server uses the message `type` to detect whether it is a request from the caption server or client (`SOURCE_HELLO` or `CLIENT_HELLO`). Then, our server has two separate handlers (`handle_source` and `handle_client_new`) to handle the websocket. The following sections will explain how each handler is implemented internally.
+When a WebSocket connects, the server reads the `type` of its first message to tell the caption source (`SOURCE_HELLO`) from a viewer (`CLIENT_HELLO`) and dispatches it to the matching handler (`handle_source` or `handle_client_new`). The following sections describe how each handler works internally.
 
 ## Server: storing captions
-We utilize a `CaptionStore` object (`server/store.py`) holding the server's view of the transcript within `keep_seconds` seconds range. To achieve this, we maintain a deque of segment numbers `order` to hold the transcript within `keep_seconds` seconds and a hashmap from segment number to the `Entry` which holds the information of the segment, including `source_ts` (source timestamp) and the text.
+The `CaptionStore` (`server/store.py`) holds the server's view of the last `keep_seconds` of the transcript. It keeps a deque `order` of segment numbers, in order, and a hashmap from segment number to an `Entry` holding the segment's `source_ts` (source timestamp), revision, finality and text.
 
-::: {#fig:caption-store}
-![`CaptionStore` implementation](./figures/caption_store.png){width=60%}
-:::
+When our backend receives a `CAPTION_UPDATE` message from the caption server, we parse and validate it into an `Entry` (malformed messages are counted and dropped), then call `store.apply(entry)`, which returns `STALE`, `DUP_FINAL`, `TOO_OLD` or `ACCEPTED` based on our **revision semantics**.
 
-When our backend receives a `CAPTION_UPDATE` message from the caption server, we parse and validate it into an `Entry` (malformed messages are counted and dropped), then call `store.apply(entry)`, which returns either `STALE`, `DUP_FINAL`,`TOO_OLD`, or `ACCEPTED` based on our **revision semantics**.
+| Result | Condition | Action |
+|---|---|---|
+| `STALE` | Segment held and `new.revision <= cur.revision` | Drop; a delayed packet never rolls a caption back |
+| `DUP_FINAL` | Segment is *already-final*[^1] (held as final, or at/below `contig_final`) | Drop; a final is never replaced |
+| `TOO_OLD` | Segment older than the oldest one on the deque (already pruned) | Drop |
+| `ACCEPTED` | Otherwise (new segments are appended; the deque is re-sorted in the rare out-of-order case) | Replace entry, prune, broadcast |
 
-- A revision is only accepted if it is strictly newer than the one we hold (`new.revision > cur.revision`); older or repeated revisions are `STALE` and dropped, so a delayed packet can never roll a caption back. 
-- Any update for a segment that is *already-final*[^1] returns `DUP_FINAL`.
-- Any update for a segment older than the oldest one on the deque (i.e., already pruned) is considered `TOO_OLD`. A new segment is simply appended (and the deque is re-sorted in the rare case it arrives out of order).
-- Otherwise, we treat it as `ACCEPTED`.
+For every `ACCEPTED` update, we update the store and then broadcast. Keeping the store current and consistent matters because a reconnecting client asks for the segments it lacks, which are served from the store by `get_history()`. While updating, we also prune outdated segments (those whose `source_ts` is older than `latest_ts - keep_seconds`, where `latest_ts` is the newest source timestamp seen) to bound the size of our deque. We use `keep_seconds = 120` and additionally cap the deque at `max_items = 500` entries in case timestamps misbehave.
 
-For all `ACCEPTED` requests, we update the store and broadcast the captions to clients. It is very important to keep the store up-to-date (and atomic) because a client that reconnects (and sends a `HISTORY` request) will ask for the segments it lacks (via `get_history()`). While updating the store, we also prune the outdated segments (segment whose `source_ts` is older than `latest_ts - keep_seconds`, where `latest_ts` is the newest source timestamp seen) to bound the size of our deque. We use `keep_seconds = 120` and additionally cap the deque at `max_items = 500` entries in case timestamps misbehave.
+After an update is accepted, `broadcast(segment)` (`solution_server.py`) hands only the *segment number* (not the text) to every connected client and returns immediately, without waiting for any network send. Each client's background sender then reads the latest text from the store when it is ready to send. How each client queues and paces these updates is described in [the next section](#server-sending-to-clients).
 
 [^1]: Checking *already-final* is tricky: since pruning removes segments from memory, we cannot simply look a segment up to know if it was finalized. We therefore keep `contig_final`, the highest $N$ such that segments $1..N$ are all final. As such, a late update for a segment at or below `contig_final` is rejected as `DUP_FINAL`.
 
@@ -53,36 +70,62 @@ On reconnect (or late join, with `last_segment = 0`), the client sends `CLIENT_H
 
 ## Server: Sending to clients
 
-When our backend receives a `CLIENT_HELLO` message from the client to initiate a connection, the server calls `CaptionStore.get_history()`, queues the result as the client's initial `HISTORY`, adds the `Client` to the `CLIENTS` set and the server spawns an asynchronous task, `asyncio.create_task(unicast(client))`, to be handled in the background.
+When a client connects (`CLIENT_HELLO`), the server queues its initial history from the store (see [Recovery semantics](#recovery-semantics)) and spawns a background sender task, `unicast(client)`. This task takes segment ids from the client's queue, reads their latest text from the store and sends them according to our protocol, which went through several versions during optimization. The table below summarizes how the sending path evolved from \vzero{} to \vsix{}; each version retains all previous functionality (controlled by `LIVERECALL_VERSION` in `config.py`).
 
-**The naive implementation (V0, `broadcast_naively`)** sends every accepted update directly to every client from inside the source handler and awaits all of the sends. This is simple and preserves ordering, but the source handler cannot move on until the *slowest* client has accepted the frame. A single slow reader therefore delays both the store update and delivery to every other client.
+[^2]: Dirty set is a dictionary that maps segment id to the time it first became dirty. A segment is dirty for a client when its content has changed in the server's store but that client hasn't been sent the new version yet. Each client has its own dirty set.
 
-The natural fix is to decouple receiving from sending, in a producer-consumer style. As shown in Figure 2, instead of waiting on each send, the server places updates on per-client queues and lets a separate task per client drain them. This is our **V1 implementation**.
+```{=latex}
+\begingroup\renewcommand{\arraystretch}{1.8}
+```
 
+| Mechanism | What it does | Problem addressed |
+|---|-------|----|
+| \vzero{} Naive broadcast | Sends each update to every client; the source awaits all sends. | One slow client stalls the source and all others. |
+| \vone{} Per-client dirty set[^2] | Each client has a FIFO queue of segment ids. `broadcast()` appends the segment id to the back of each client's queue (if already queued, it keeps its place, so repeated edits coalesce into one entry) and wakes that client's sender. The sender pops from the front and reads the segment's latest text from the store at send time. Close the client if its queue reaches 100 segments. | Backlog bounded by segments, not edits; slow readers block no one. *Issue:* `send()` returns once data is in the OS socket buffer, so the queue drains instantly and stays near zero; the real backlog hides in socket/client buffers, invisible to the server. |
+| \vtwo{} Ping flow control | Ping after each send; wait for pong up to `PONG_WAIT` = 1 s. This ensures that the client has read every earlier message off the socket. | It solves the queue draining problem. We also use pong RTT for further optimizations (e.g., detecting client read rates). |
+| \vthree{} Lag-window disconnect | Forcing client to disconnect when the oldest dirty entry is greater than  `MAX_LAG_WINDOW` = 10 s.| Bounds staleness; client recovers via `HISTORY`. |
+| \vfour{} Lag mode (for slow clients) | Enter this mode if dirty age > 0.5 s or a pong > 0.3 s. Under lag mode, we send the missing finals oldest first. We only send the newest provisional messages after `LAG_PROV_GAP` = 4 s idle. Exiting lag mode requires 3 fast pongs and a 3-second minimum duration. | For slow clients, finals never delayed; unreadable intermediate revisions skipped. *Issue:* fast pongs only show the client is reading quickly *now*, not that it has caught up; it can leave lag mode with stale messages still in its receive buffer, fall behind again and oscillate between modes. |
+| \vfive{} **Buffer-aware lag exit** | Fast pongs are no longer enough to exit: the server also estimates whether the client's receive buffer has drained (estimated reads > messages sent in lag + 36; see [Receive buffer estimation](#receive-buffer-estimation)). Soft-pong threshold lowered to 0.2 s. | Fixes the \vfour{} issue: no premature return to full updates, so no oscillation; also earlier lag detection. *Issue:* the lag-mode sender polls every 0.1 s and waits for a pong after every message, so a new final can sit for up to one poll interval plus a full RTT, and on a high-latency link throughput is capped at one message per RTT. |
+| \vsix{} Event-driven pacing | Lag-mode sender sleeps on an event (woken by `broadcast()`) instead of polling every 0.1 s; a final that arrives while a pong is outstanding is sent at once; in lag mode it pings once every 4 messages (`PING_EVERY_N`) rather than after each one. | Fixes the \vfive{} issue: new finals go out immediately instead of waiting for the next poll or pong. |
 
-![Client-handling pipeline across V0–V4; colour tags mark the version that introduces each step: (1) client join, (2) handling an accepted update, (3) the per-client sender loop.](./figures/client_fsm.png)
+```{=latex}
+\endgroup
+```
 
-### V1 - Decoupling
+### Receive buffer estimation
 
-When an update is accepted, the server does not wait for any client. It simply notes that each client has something new to send and wakes that client's sender task, so the server can go straight back to reading from the source. Each sender task then delivers the client's history first, followed by the pending updates in order, skipping anything the client no longer needs. Because the text is looked up at the moment of sending, the client always receives the latest version of each caption.
+The server cannot see a client's receive buffer, i.e. the messages the client's WebSocket library has received but the client has not yet processed. A fast pong shows the client is reading quickly *now*, not that the buffer is empty, so from \vfive{} onwards the server estimates the backlog conservatively before letting a client leave lag mode:
 
-### V2 - Backpressure
+1. **Assume the buffer was full when lag began.** `LAG_QUEUE_GUESS` = 32 messages, a deliberately high guess.
+2. **Estimate the per-message read time** `iv_est` from pong RTTs during lag. While the buffer is full, each pong returns about one read interval after the previous one. We keep the largest value seen (capped at `IV_CAP` = 2 s), since overestimating is the safe direction.
+3. **Count reads.** Estimated reads = time in lag / `iv_est`. The client must work through the 32 assumed messages plus every message sent during lag (`lag_sent`).
+4. **Exit only once it has caught up:** `reads - lag_sent >= LAG_QUEUE_GUESS + LAG_EXIT_MARGIN` (32 + 4), together with 3 fast pongs.
 
-In V1, a slow client's backlog still grows with every revision, and the server has no idea how fast the client is reading. V2 keeps only the latest pending change per caption segment, so repeated edits to the same segment collapse into one, and the backlog is limited by the number of segments rather than the number of edits. After each send, the server also waits for a quick round-trip check from the client; this confirms the client has caught up, and a growing round-trip time is the signal used by later versions to detect a slow client.
+For example, a client reading one message every 0.5 s that has been sent 10 messages in lag needs about 46 reads (~23 s) before it may exit. Overestimating the buffer only delays the exit slightly, while underestimating would send the client back into lag almost immediately. This check applies when the slowness is the client's own; when many clients lag at once (a shared cause), the client instead has to stay fast for a minimum calm period.
 
-### V3 - Lag-window disconnect
+Putting the pieces together, each client's sender is a small two-state machine, in normal mode (every update, one pong per message) or lag mode (finals first, rationed provisionals). The transitions between the two states are the core of our backpressure policy and are summarised below.
 
-If a client falls more than 10 s behind, or its backlog reaches 100 segments, the server disconnects it as "too slow". This stops a hopeless client from holding server memory and receiving stale captions; it can reconnect and catch up through history (see Recovery semantics).
+\bwarn
 
-### V4 - Lag mode
+**Normal  &rarr; Lag.** The server switches a client to lag mode as soon as it looks like the client cannot keep up: updates are piling up unsent, or its pongs come back slowly (measured relative to its normal RTT). From then on it sends only what matters: missing finals, plus an occasional latest provisional.
 
-Rather than only disconnecting slow clients, V4 lets them switch into a catch-up mode. A client normally receives every revision in order, but once it falls about half a second behind, or repeatedly responds slowly, the server stops sending each intermediate edit. Instead, it sends all the finished captions the client is missing in a single message, followed by only the most recent in-progress caption. The server also learns roughly how fast each lagging client reads and how much it can absorb at once, and waits until the client should have caught up before sending more, so every message is as fresh as possible. The client returns to normal mode only once it has been consistently fast for a short while, which avoids switching back and forth.
+**Lag &rarr; Normal.** The client returns to normal mode once its pongs are fast again *and* it has caught up. If the slowness was the client's own, "caught up" means its backlog has drained; if many clients lagged at once (a shared cause), it must stay fast for a while, and that wait grows each time it relapses.
+
+\ewarn
+
+### Addressing the two advanced challenges
+
+**Challenge 1: Slow-reader semantic backpressure.** Each client's backlog is bounded by its dirty set (at most 100 segments) and the 10 s lag window (\vone{}, \vthree{}), so it does not grow with the edit rate. Since repeated edits to a segment coalesce into one entry, superseded provisionals are never queued, and in lag mode only the newest provisional is sent (\vfour{}). Because `broadcast()` never waits and every client has its own sender task, a slow reader cannot delay the source or other clients. Finals are still sent oldest first in lag mode, and a client that gets cut off recovers them through `HISTORY`.
+
+**Challenge 2: Constrained-bandwidth semantic delivery.** We use ping/pong flow control (\vtwo{}) to detect the bottleneck: when the link is congested, pongs come back slowly, which puts the client into lag mode (\vfour{}, \vfive{}). The remaining bandwidth then goes to missing finals first, then the latest provisional, while intermediate revisions are skipped instead of building a stale backlog. Once pongs are fast again and the client's queue has drained, it returns to normal mode and receives full updates again.
 
 ## Client (`app.js`)
 
-The browser client opens a WebSocket, sends `CLIENT_HELLO`, and renders every `CAPTION_UPDATE` and `HISTORY` item through one `append()` path in `FrontEndRenderer`, which maps each segment to a DOM row holding its `revision_id`, `source_ts` and `is_final`. A message updates its row only if `msg.revision > row.revision_id`, replacing the text in place so each segment appears once with its latest text; `is_final` is sticky, and rows are re-sorted by segment when updates arrive out of order. Since `HISTORY` items pass through the same check, overlap with live updates is deduplicated for free. The client keeps finals for `KEEP_MESSAGE_WINDOW = 90` s (above the required 60 s), pruning once a second, while the 15/30/60 s recall view only hides rows, so switching windows needs no server request. On close, the client reconnects with `last_segment`, `last_revision` and `history_seconds = 60` under a stable `client_id` from `sessionStorage`, so a client dropped by V3 (close code 1013) recovers its missing finals through `HISTORY`; only a 1008 close (protocol violation, e.g. an invalid hello) is shown to the user instead of triggering a reconnect.
+The browser client opens a WebSocket, sends `CLIENT_HELLO`, and renders every `CAPTION_UPDATE` and `HISTORY` item through one `append()` path in `FrontEndRenderer`, which maps each segment to a DOM row holding its `revision_id`, `source_ts` and `is_final`. A message updates its row only if `msg.revision > row.revision_id`, replacing the text in place so each segment appears once with its latest text; `is_final` is sticky, and rows are re-sorted by segment when updates arrive out of order. Since `HISTORY` items pass through the same check, overlap with live updates is deduplicated for free. The client keeps finals for `KEEP_MESSAGE_WINDOW = 90` s (above the required 60 s), pruning once a second, while the 15/30/60 s recall view only hides rows, so switching windows needs no server request. On close, the client reconnects with `last_segment`, `last_revision` and `history_seconds = 60` under a stable `client_id` from `sessionStorage`, so a client disconnected as too slow (close code 1013) recovers its missing finals through `HISTORY`; only a 1008 close (protocol violation, e.g. an invalid hello) is shown to the user instead of triggering a reconnect.
 
 # Results
+
+The before/after comparison uses three server versions, v5, v6 and v7 (see `test_results.md`): v5 is the baseline with per-client queues, ping flow control and lag mode; v6 replaces lag-mode polling with event-driven wake-up; v7 judges lag by RTT above the idle minimum and requires two soft-slow pongs. Each of the 24 public tests was run 3 times per version and we report the median.
 
 # Discussion
 
