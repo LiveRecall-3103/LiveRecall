@@ -1,0 +1,37 @@
+{
+  "clients": 300,
+  "live_caption_messages": 22815,
+  "recovered_history_items": 2,
+  "accepted": 22815,
+  "recovered": 2,
+  "duplicates": 0,
+  "stale": 0,
+  "invalid_history_nonfinal": 0,
+  "connections": 300,
+  "connection_errors": 0,
+  "p50_ms": 306.413,
+  "p95_ms": 750.0085999999997,
+  "p99_ms": 1269.1414,
+  "fresh_pct": 88.7091825553364,
+  "fresh_final_pct": 88.69736842105263,
+  "fresh_final_count": 20223,
+  "fresh_final_denominator": 22800,
+  "unique_finals": 22800,
+  "expected_finals_total": 22800,
+  "final_completeness_pct": 100.0,
+  "unique_live_revisions": 22815,
+  "expected_updates_total": 68400,
+  "normal_update_coverage_pct": 33.35526315789474,
+  "normal_clients": {
+    "messages": 18251,
+    "p50_ms": 304.773,
+    "p95_ms": 719.326,
+    "fresh_pct": 89.4855076434168
+  },
+  "slow_clients": {
+    "messages": 4564,
+    "p50_ms": 312.5795,
+    "p95_ms": 833.4014500000002,
+    "fresh_pct": 85.60473269062226
+  }
+}

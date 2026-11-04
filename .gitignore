@@ -9,6 +9,5 @@ results/
 !docs/report.pdf
 !report.pdf
 *.csv
-*.json
 analytics/figures/
 myenv/
