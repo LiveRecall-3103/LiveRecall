@@ -1,0 +1,3 @@
+t1-t4: none
+t1-t4: none
+t5-t8: bandwidth_2mbit
