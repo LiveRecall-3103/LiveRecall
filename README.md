@@ -100,7 +100,7 @@ python run_demo.py --clients 100 --duration 60 --runs 3 \
 The same tests through `make` (outputs go to `analytics/results/`):
 
 ```bash
-make T1 V=6   # also T2, T3, T4 (V= is required)
+make T1 V=6   # also T2, T3, T4; V= is required but only names the output files (always runs solution_server.py)
 ```
 
 Optional memory trace during T3, in another terminal:
@@ -222,9 +222,9 @@ On reconnect (or late join, with `last_segment = 0`) the client sends `CLIENT_HE
 | v3 Lag-window disconnect | Disconnect a client whose oldest dirty entry is older than `MAX_LAG_WINDOW` = 10 s. | Bounds staleness; the client recovers via `HISTORY`. |
 | v4 Lag mode | For slow clients: missing finals oldest first, newest provisional only after `LAG_PROV_GAP` = 4 s idle. | Finals never delayed; unreadable intermediate revisions skipped. |
 | v5 Buffer-aware lag exit | Exit lag only when pongs are fast *and* the estimated receive buffer has drained. | Stops clients leaving lag with a full buffer and oscillating. |
-| v6 Event-driven pacing | Lag-mode sender waits on an event from `broadcast()` instead of polling every 0.1 s; sends a new final at once even with a pong outstanding; pings every 2 messages (`PING_EVERY_N` = 2). | New finals go out immediately, and lag-mode throughput on high-latency links roughly doubles. |
+| v6 Event-driven pacing | Lag-mode sender waits on an event from `broadcast()` instead of polling every 0.1 s; sends a new final at once even with a pong outstanding; pings every 2 messages (`PING_EVERY_N` = 2); relaxed lag-exit settings (margin 4 → 2, `IV_CAP` 2 → 1 s, fast pongs 3 → 1). | New finals go out immediately, and lag-mode throughput on high-latency links roughly doubles; recovered clients leave lag mode sooner. |
 
-**Receive-buffer estimate (v5+).** The server cannot see a client's receive buffer, so before letting a client leave lag mode it estimates the backlog conservatively:
+**Receive-buffer estimate (v5+, v6 values shown).** The server cannot see a client's receive buffer, so before letting a client leave lag mode it estimates the backlog conservatively:
 
 1. Assume the buffer was full when lag began: `LAG_QUEUE_GUESS` = 32 messages.
 2. Estimate the per-message read time `iv_est` from pong RTTs during lag, keeping the largest value seen (capped at `IV_CAP` = 1 s; initially the RTT of the pong that triggered lag, at least 0.1 s).

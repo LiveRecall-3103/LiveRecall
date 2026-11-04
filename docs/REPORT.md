@@ -52,7 +52,7 @@ When a WebSocket connects, the server reads the `type` of its first message to t
 ## Server: storing captions
 The `CaptionStore` (`server/store.py`) holds the server's view of the last `keep_seconds` of the transcript. It keeps a deque `order` of segment numbers, in order, and a hashmap from segment number to an `Entry` holding the segment's `source_ts` (source timestamp), revision, finality and text.
 
-When our backend receives a `CAPTION_UPDATE` message from the caption server, we parse and validate it into an `Entry` (malformed messages are counted and dropped), then call `store.apply(entry)`, which returns `STALE`, `DUP_FINAL`, `TOO_OLD` or `ACCEPTED` based on our **revision semantics**.
+When our backend receives a `CAPTION_UPDATE` message from the caption source, we parse and validate it into an `Entry` (malformed messages are counted and dropped), then call `store.apply(entry)`, which returns `STALE`, `DUP_FINAL`, `TOO_OLD` or `ACCEPTED` based on our **revision semantics**.
 
 | Result | Condition | Action |
 |---|---|---|
@@ -86,10 +86,10 @@ When a client connects (`CLIENT_HELLO`), the server queues its initial history f
 | \vzero{} Naive broadcast | Sends each update to every client; the source awaits all sends. | One slow client stalls the source and all others. |
 | \vone{} Per-client dirty set[^2] | Each client has a FIFO queue of segment ids. `broadcast()` appends the segment id to the back of each client's queue (if already queued, it keeps its place, so repeated edits coalesce into one entry) and wakes that client's sender. The sender pops from the front and reads the segment's latest text from the store at send time. Close the client if its queue reaches 100 segments. | Backlog bounded by segments, not edits; slow readers block no one. *Issue:* `send()` returns once data is in the OS socket buffer, so the queue drains instantly and stays near zero; the real backlog hides in socket/client buffers, invisible to the server. |
 | \vtwo{} Ping flow control | Ping after each send; wait for pong up to `PONG_WAIT` = 1 s. This ensures that the client has read every earlier message off the socket. | It solves the queue draining problem. We also use pong RTT for further optimizations (e.g., detecting client read rates). |
-| \vthree{} Lag-window disconnect | Forcing client to disconnect when the oldest dirty entry is greater than  `MAX_LAG_WINDOW` = 10 s.| Bounds staleness; client recovers via `HISTORY`. |
+| \vthree{} Lag-window disconnect | Force the client to disconnect when its oldest dirty entry is older than `MAX_LAG_WINDOW` = 10 s. | Bounds staleness; client recovers via `HISTORY`. |
 | \vfour{} Lag mode (for slow clients) | Enter this mode if dirty age > 0.5 s or a pong > 0.3 s. Under lag mode, we send the missing finals oldest first. We only send the newest provisional messages after `LAG_PROV_GAP` = 4 s idle. Exiting lag mode requires 3 fast pongs and a 3-second minimum duration. | For slow clients, finals never delayed; unreadable intermediate revisions skipped. *Issue:* fast pongs only show the client is reading quickly *now*, not that it has caught up; it can leave lag mode with stale messages still in its receive buffer, fall behind again and oscillate between modes. |
-| \vfive{} **Buffer-aware lag exit** | Fast pongs are no longer enough to exit: the server also estimates whether the client's receive buffer has drained (estimated reads > messages sent in lag + 36; see [Receive buffer estimation](#receive-buffer-estimation)). Soft-pong threshold lowered to 0.2 s. | Fixes the \vfour{} issue: no premature return to full updates, so no oscillation; also earlier lag detection. *Issue:* the lag-mode sender polls every 0.1 s and waits for a pong after every message, so a new final can sit for up to one poll interval plus a full RTT, and on a high-latency link throughput is capped at one message per RTT. |
-| \vsix{} Event-driven pacing | Lag-mode sender sleeps on an event (woken by `broadcast()`) instead of polling every 0.1 s; a final that arrives while a pong is outstanding is sent at once; in lag mode it pings once every 2 messages (`PING_EVERY_N` = 2) rather than after each one. | Fixes the \vfive{} issue: new finals go out as soon as they arrive instead of waiting for the next poll, and halving the pings roughly doubles lag-mode throughput on a high-latency link. |
+| \vfive{} **Buffer-aware lag exit** | Fast pongs are no longer enough to exit: the server also estimates whether the client's receive buffer has drained (estimated reads $\ge$ messages sent in lag + 32 + 4; see [Receive buffer estimation](#receive-buffer-estimation)). Soft-pong threshold lowered to 0.2 s. | Fixes the \vfour{} issue: no premature return to full updates, so no oscillation; also earlier lag detection. *Issue:* the lag-mode sender polls every 0.1 s and waits for a pong after every message, so a new final can sit for up to one poll interval plus a full RTT, and on a high-latency link throughput is capped at one message per RTT. |
+| \vsix{} Event-driven pacing | Lag-mode sender sleeps on an event (woken by `broadcast()`) instead of polling every 0.1 s; a final that arrives while a pong is outstanding is sent at once; in lag mode it pings once every 2 messages (`PING_EVERY_N` = 2) rather than after each one. Lag-exit settings relaxed: `LAG_EXIT_MARGIN` 4 → 2, `IV_CAP` 2 → 1 s, `LAG_CALM_PONGS` 3 → 1. | Fixes the \vfive{} issue: new finals go out as soon as they arrive instead of waiting for the next poll, and halving the pings roughly doubles lag-mode throughput on a high-latency link; recovered clients also leave lag mode sooner. |
 
 ```{=latex}
 \endgroup
@@ -104,7 +104,7 @@ The server cannot see a client's receive buffer, i.e. the messages the client's 
 3. **Count reads.** Estimated reads = time in lag / `iv_est`. The client must work through the 32 assumed messages plus every message sent during lag (`lag_sent`).
 4. **Exit only once it has caught up:** `reads - lag_sent >= LAG_QUEUE_GUESS + LAG_EXIT_MARGIN` (32 + 2), and the latest pong was fast (`LAG_CALM_PONGS` = 1, RTT $\le$ 0.2 s). On exit, every in-progress (non-final) segment is marked dirty again so the client immediately receives their latest text.
 
-For example, a client reading one message every 0.5 s that has been sent 10 messages in lag needs about 44 reads (~22 s) before it may exit. Overestimating the buffer only delays the exit slightly, while underestimating would send the client back into lag almost immediately. (\vfive{} originally used a margin of 4, `IV_CAP` = 2 s and 3 fast pongs; we relaxed these so clients leave lag mode sooner once they recover.)
+For example, a client reading one message every 0.5 s that has been sent 10 messages in lag needs about 44 reads (~22 s) before it may exit. Overestimating the buffer only delays the exit slightly, while underestimating would send the client back into lag almost immediately. (The values above are \vsix{}'s; \vfive{} used a margin of 4, `IV_CAP` = 2 s and 3 fast pongs.)
 
 Putting the pieces together, each client's sender is a small two-state machine, in normal mode (every update, one pong per message) or lag mode (finals first, rationed provisionals). The transitions between the two states are the core of our backpressure policy and are summarised below.
 
@@ -128,7 +128,7 @@ The browser client opens a WebSocket, sends `CLIENT_HELLO`, and renders every `C
 
 # Results
 
-We compare the baseline \vfive{} (`solution_server_v5.py`) against the submitted \vsix{} (`solution_server.py`), which replaces lag-mode polling with event-driven wake-up, pings every 2 messages in lag mode, and relaxes the lag-exit constants. Each public test (T1-T5) was run 3 times per version on Ubuntu 26.04 loopback `lo` with `tc netem` to constraint the networking condition. We use the unmodified `run_demo.py` / `analyse_results.py`; we report medians with freshness threshold of 500 ms.[^raw] Full numeric tables are in `README.md` (Results).
+We compare the baseline \vfive{} (`solution_server_v5.py`, on the `archive` branch) against the submitted \vsix{} (`solution_server.py`), which replaces lag-mode polling with event-driven wake-up, pings every 2 messages in lag mode, and relaxes the lag-exit constants. Each public test (T1-T5) was run 3 times per version on Ubuntu 26.04 loopback `lo` with `tc netem` to constrain the networking condition. We use the unmodified `run_demo.py` / `analyse_results.py`; we report medians with freshness threshold of 500 ms.[^raw] Full numeric tables are in `README.md` (Results).
 
 | Test | Clients | Duration | Condition |
 |---|---|---|---|
@@ -164,7 +164,7 @@ T1 bars are nearly identical in Figure 3 (the load is too light to queue), and T
 
 - **Freshness vs coverage under impairment:** we trade provisional coverage for on-time finals (T5 note above).
 - **Slow clients:** a 500 ms/msg reader cannot physically receive more, so we skip provisionals rather than disconnect; the 10 s lag-window disconnect bounds staleness.
-- **Lag-mode exit is conservative:** the buffer estimate (32 + 2 messages) keeps clients in lag mode for most of a run once entered, which is why T5 coverage stays low for the whole test. A shorter `LAG_QUEUE_GUESS`, or a client-echoed sequence number, would let clients leave earlier.
+- **Lag-mode exit is conservative:** the buffer estimate (32 + 2 messages) keeps clients in lag mode for most of a run once entered, which is why T5 coverage stays low for the whole test. A smaller `LAG_QUEUE_GUESS`, or a client-echoed sequence number, would let clients leave earlier.
 - **Ping/pong overhead:** one extra frame per message in normal mode; acceptable on LAN, halved in lag mode by \vsix{}.
 - **Failures during development:** \vone{} drained queues into socket buffers, hiding backlog; \vfour{} oscillated in and out of lag mode; \vfive{} lagged on high-RTT links at one message per RTT, fixed in \vsix{}.
 
@@ -177,11 +177,11 @@ T1 bars are nearly identical in Figure 3 (the load is too light to queue), and T
 
 # Conclusion
 
-We have achieved a 100% completion rate across all public tests, achieving zero stale or duplicate packets, isolating slow clients, and maintaining bounded memory. This assignment offers a brief overview of network programming, teaching us how to build the intuition required to design protocols that handle congestion, handle unexpected network disruptions, and scale efficiently as client volume increases.
+We have achieved 100% final completeness across all public tests, with zero stale or duplicate finals, isolating slow clients, and maintaining bounded memory. This assignment offers a brief overview of network programming, teaching us how to build the intuition required to design protocols that handle congestion, handle unexpected network disruptions, and scale efficiently as client volume increases.
 
 For future work or FYP, we can experiment on the idea of client-acknowledged sequence numbers for exact backlog, adaptive thresholds from measured RTT baseline (so a uniformly delayed link is not treated as lagged), or using congestion control that closely resembles modern TCP flow and congestion control protocols.
 
-[^raw]: Raw per-run results are in `tests/test_results/public/v5/` and `tests/test_results/public/v6/` (`tN_run0X.json`, 3 runs per test). Reproduce with `./run_public_tests.sh` (set `SERVER`, `OUT`, `LIVERECALL_VERSION`); figures are generated by `docs/figures/plot_results.ipynb`.
+[^raw]: Raw per-run results are in `tests/test_results/public/v5/` and `tests/test_results/public/v6/` (`tN_run0X.json`, 3 runs per test). Reproduce with `./run_public_tests.sh` (set `SERVER` and `OUT`; for \vfive{}, first run `git show archive:solution_server_v5.py > solution_server_v5.py`); figures are generated by `docs/figures/plot_results.ipynb`.
 
 \newpage
 
