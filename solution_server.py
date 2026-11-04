@@ -27,14 +27,14 @@ LAG_AGE_ENTER = 0.5      # s: sender stuck, dirty queue ageing -> lagging
 PONG_WAIT = 1.0          # s: the sender never blocks on a pong longer than this
 LAG_PONG_HARD = 1.0      # s: one pong this slow (or a timeout) -> lagging
 LAG_PONG_SOFT = 0.2
-PING_EVERY_N = 4
+PING_EVERY_N = 2
 
 # ---- lag behaviour ----
 LAG_PROV_GAP = 4.0       # s: while lagging, a provisional only after this long with no send
-LAG_CALM_PONGS = 3       # fast pongs in a row needed before the exit estimate is consulted
+LAG_CALM_PONGS = 1       # fast pongs in a row needed before the exit estimate is consulted
 LAG_QUEUE_GUESS = 32     # assumed size of the client library's receive queue (conservative)
-LAG_EXIT_MARGIN = 4.0    # extra messages of drain required before leaving lag mode
-IV_CAP = 2.0             # s: upper bound on the estimated client read interval
+LAG_EXIT_MARGIN = 2      # extra messages of drain required before leaving lag mode
+IV_CAP = 1.0             # s: upper bound on the estimated client read interval
 
 # Counters for the report
 LAG_DROPS = 0
