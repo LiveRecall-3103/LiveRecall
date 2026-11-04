@@ -23,12 +23,11 @@ python3 -m venv asr-venv && asr-venv/bin/pip install -r bonus_asr/requirements-a
 Choose the audio input with `AUDIO_INPUT` in `asr_source.py`:
 
 ```python
-AUDIO_INPUT = ["-f", "pulse", "-i", "RDPSource"]   # default: mic under WSL (WSLg)
-AUDIO_INPUT = ["-f", "pulse", "-i", "default"]     # mic on native Linux
+AUDIO_INPUT = ["-f", "pulse", "-i", "default"]     # default: system microphone
 AUDIO_INPUT = ["-re", "-i", "lecture.wav"]         # audio or video file, played in real time
 ```
 
-`RDPSource` only exists under WSLg; on native Linux or a VM, use one of the other two.
+A VM usually has no microphone; use the file input there.
 
 Run each command in its own terminal, in this order, from the repo root:
 
