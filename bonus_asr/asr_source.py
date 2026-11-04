@@ -20,8 +20,9 @@ SEGMENT_TIMING_SEC = 5      # Each segment is 5 seconds
 FIRST_REVISION_SEC = 2      # Wait for 2s for audio to stabalize before parsing it to ASR model
 MAX_QUEUE_CHUNKS = 30        # at most 30 * 1 = 30 s of waiting audio
 
-# Microphone. To use a video file instead: ["-re", "-i", "lecture.mp4"]
-AUDIO_INPUT = ["-f", "pulse", "-i", "RDPSource"]   # Microphone input
+# Audio input. Uncomment one:
+AUDIO_INPUT = ["-f", "pulse", "-i", "default"]     # default: system microphone
+# AUDIO_INPUT = ["-re", "-i", "lecture.wav"]       # audio or video file, played in real time
 
 # Initialize audio queue to keep audio chunks from ffmpeg
 audio_queue = queue.Queue()
@@ -68,7 +69,18 @@ async def main():
         ffmpeg_command = ffmpeg_command + ["-vn", "-af", "asetpts=N/SR/TB", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "-"]
         ffmpeg = subprocess.Popen(ffmpeg_command, stdout=subprocess.PIPE, start_new_session=True)
         threading.Thread(target=read_audio, args=(ffmpeg,), daemon=True).start()
-        asyncio.get_running_loop().add_signal_handler(signal.SIGINT, ffmpeg.terminate)
+        loop = asyncio.get_running_loop()
+        stopping = False
+
+        # First Ctrl+C: stop now without transcribing the queued audio. Second Ctrl+C: force quit.
+        def stop():
+            nonlocal stopping
+            stopping = True
+            ffmpeg.terminate()
+            audio_queue.put(None)  # wake the loop if it is waiting for audio
+            loop.remove_signal_handler(signal.SIGINT)
+
+        loop.add_signal_handler(signal.SIGINT, stop)
 
         segment_number = 1      # Which segment number is this
         revision = 0            # Last revision sent for this segment, 0 if none sent yet
@@ -80,7 +92,7 @@ async def main():
 
                 # Dequeue item and timestamp from queue
                 item = await asyncio.to_thread(audio_queue.get)
-                if item is None:
+                if item is None or stopping:
                     break
                 chunk_time, raw_audio = item
 
