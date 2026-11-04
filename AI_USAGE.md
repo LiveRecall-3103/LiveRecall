@@ -2,7 +2,20 @@
 
 ## Tools used
 
-List the generative-AI/coding tools used by the team and what each was used for.
+Our group used Claude as a coding assistant. We mainly used it to propose and refine ideas, and generate scripts to make testing easier and faster, and analyze failures of each test sets. 
+
+The breakdown is as follows:
+- Debugging
+  - Finding why lagging client never left lag mode
+- Designing and Trying flow control ideas:
+  - Timed pings for lagging clients
+  - `tc` based congestion detection
+- Testing scripts:
+  - Write some examples of hidden test cases to approximate the instructor's hidden test set
+  - Write scripts (`run_private_tests.sh` and `run_public_tests.sh`) to mass run the test sets
+  - Analyzing the failures of each test set to improve future iterations
+- Documentation
+  - Housekeeping of documentations
 
 ## One useful suggestion
 
