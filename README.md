@@ -5,9 +5,9 @@
 | Name | Student ID | Main responsibility |
 |---|---|---|
 | Aw Ming Xuan `@icyyolo` | A0308470H | Live-caption client UI (recall filters 15/30/60s, revision replacement, 90s pruning); client auto-reconnect with resume state & HISTORY merge; lag detection/exit tuning (idle-RTT baseline, soft-pong entry, shared-bottleneck exit, slow-reader pinning); bonus ASR source with draft/final revisions; public test runs & results |
-| Kosolpattanadurong Thitiwat `@CATISNOTSODIUM` | A0305613N | Architecture & protocol design docs; history-window and disconnect-window optimisations (opt_server.py); client handling; utilities, Makefile, private test scripts & analytics; report writing and PDF generation |
+| Kosolpattanadurong Thitiwat `@CATISNOTSODIUM` | A0305613N | Architecture & protocol design docs; history-window and disconnect-window optimisations; client handling; utilities, Makefile, private test scripts & analytics; report writing and PDF generation |
 | Lee Zhao Rui `@oilyfishball` | A0308380H | Starter-kit setup & docs organisation; per-connection send queues with unicast error handling, overflow drop & stale-packet removal; ping-based flow control, version control, disconnected-client handling; smart pacing & pipelining; results and AI usage declaration |
-| Wong Ji Kean `@ji-just-ji` | A0252449Y | Caption store (store.py) and Source→Server update parsing with tests; batch-sending optimisation; data-structure optimisation moving work into store; send-timing/lag constant tuning; stress-testing harness (run_stress.py) | 
+| Wong Ji Kean `@ji-just-ji` | A0252449Y | Caption store (store.py) and Source→Server update parsing with tests; batch-sending optimisation; data-structure optimisation moving work into store; send-timing/lag constant tuning; stress-testing harness | 
 
 
 ## Ubuntu setup
@@ -70,7 +70,7 @@ If you run Ubuntu in a VM and the browser is on the host, either use a browser i
 
 ## Public deterministic tests
 
-Unit test for the caption store (run from the parent folder of the project, because it imports `LiveRecall.server.store`):
+Unit test for the caption store (the project folder must be named `LiveRecall`; run it from the parent folder, because it imports `LiveRecall.server.store`):
 
 ```bash
 cd ..
@@ -78,7 +78,7 @@ python -m LiveRecall.tests.test_store    # prints "ok"
 cd LiveRecall
 ```
 
-T1–T4. `run_demo.py` starts a new server for every run, uses a fixed seed (`--seed 3103` by default), and writes `<stem>.csv` / `<stem>.json`. Each test does 3 independent runs, and we report the median.
+T1–T4. `run_demo.py` starts a new server for every run, uses a fixed seed (`--seed 3103` by default), and writes `<stem>_runNN.csv` / `.json` for each run. Each test does 3 independent runs, and we report the median.
 
 ```bash
 # T1 - basic correctness
@@ -100,7 +100,7 @@ python run_demo.py --clients 100 --duration 60 --runs 3 \
 The same tests through `make` (outputs go to `analytics/results/`):
 
 ```bash
-make T1   # also T2, T3, T4
+make T1 V=6   # also T2, T3, T4 (V= is required)
 ```
 
 Optional memory trace during T3, in another terminal:
@@ -119,18 +119,17 @@ sudo ./network_profiles/reset.sh lo      # always clear the impairment afterward
 
 The profiles available in `network_profiles/` are `bandwidth_2mbit`, `bandwidth_500kbit`, `delay_100ms`, `delay_loss`, `loss_3pct`, and `reorder`.
 
-To run T1–T4 under each profile one after another (numbering the outputs from `t1`, and logging stem → profile in `test_profiles.txt`):
+To run T1–T5 in one go (3 runs each, T5 under `delay_loss`; results go to `tests/test_results/public/v6/`):
 
 ```bash
-./run_public_tests.sh 1                       # none + all default profiles
-./run_public_tests.sh 25 bandwidth_500kbit    # one specific profile
+./run_public_tests.sh
 ```
 
 The script asks for `sudo` once and resets `lo` when it exits, even after a failure or Ctrl-C.
 
 ### Results
 
-Median of 3 runs per test, freshness threshold T = 500 ms, Ubuntu loopback. v6 = submitted `solution_server.py`, v5 = `solution_server_v5.py`.
+Median of 3 runs per test, freshness threshold T = 500 ms, Ubuntu loopback. v6 = submitted `solution_server.py`, v5 = the previous version (see Design notes).
 
 | Test | Clients | Duration | Condition |
 |---|---|---|---|
@@ -213,7 +212,7 @@ On reconnect (or late join, with `last_segment = 0`) the client sends `CLIENT_HE
 
 ### Per-client buffering/backpressure
 
-`broadcast(segment)` hands only the segment number to every client and returns at once without waiting on any send. Each client has a background sender, `unicast(client)`, that reads the segment's latest text from the store when it is ready to send. The sending path went through several versions; each one keeps everything before it, and the submitted `solution_server.py` is v6 (`LIVERECALL_VERSION` in `config.py` selects older versions for comparison).
+`broadcast(segment)` hands only the segment number to every client and returns at once without waiting on any send. Each client has a background sender, `unicast(client)`, that reads the segment's latest text from the store when it is ready to send. The sending path went through several versions; each one keeps everything before it, and the submitted `solution_server.py` is v6.
 
 | Version | What it does | Problem addressed |
 |---|---|---|

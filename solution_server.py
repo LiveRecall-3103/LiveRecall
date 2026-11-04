@@ -20,7 +20,7 @@ import websockets
 
 from server.store import CaptionStore, Entry, ACCEPTED
 
-MAX_LAG_WINDOW = 3.0    # s: normal-mode dirty age that disconnects (V3)
+MAX_LAG_WINDOW = 10.0   # s: normal-mode dirty age that disconnects (V3)
 
 # ---- lag detection (pong based) ----
 LAG_AGE_ENTER = 0.5      # s: sender stuck, dirty queue ageing -> lagging
