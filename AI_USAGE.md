@@ -30,14 +30,12 @@ The breakdown is as follows:
 
 **How I verified it:** I ran `run_demo.py` with the public harness on different settings and checked that final-caption completeness stayed at the expected level, there were no duplicate or stale messages, and server memory stayed flat. Results improved slightly compared with the earlier version. 
 
-I did not record a before/after measurement when the design was introduced, so I can't give a before/after comparison.
+I did not record measurements for the old per-client-copy version, so I can't give a before/after comparison.
 
 **How I built on it:** I adopted the suggested structure largely as proposed. My own additions were in the ping/pong handling on top of it: using pong round-trip time to decide when a client enters and leaves lag mode, and pacing sends by waiting on pongs.
 `
 
 ## One suggestion that was wrong, inefficient, or required modification
-
-Include a short generated suggestion/code fragment or precise description, explain the problem, and describe your correction.
 
 Solution that AI suggested is to add a fixed pinger every 2 seconds.
 ```
