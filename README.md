@@ -128,6 +128,39 @@ To run T1–T4 under each profile one after another (numbering the outputs from 
 
 The script asks for `sudo` once and resets `lo` when it exits, even after a failure or Ctrl-C.
 
+### Results
+
+Median of 3 runs per test, freshness threshold T = 500 ms, Ubuntu loopback. v6 = submitted `solution_server.py`, v5 = `solution_server_v5.py`.
+
+| Test | Clients | Duration | Condition |
+|---|---|---|---|
+| T1 | 20 | 20 s | normal |
+| T2 | 100 | 40 s | normal |
+| T3 | 100 | 60 s | 10% slow readers, 500 ms/msg |
+| T4 | 100 | 60 s | 20% disconnect at 15 s for 5 s |
+| T5 | 100 | 40 s | `delay_loss`: 120 ms ± 30 ms delay, 3% loss |
+
+**v6 results**
+
+| Test | P50 / P95 / P99 (ms) | Fresh % | Fresh-final % | Completeness % | Coverage % |
+|---|---|---|---|---|---|
+| T1 | 1.4 / 2.0 / 2.5 | 100 | 100 | 100 | 100 |
+| T2 | 3.4 / 5.2 / 6.1 | 100 | 100 | 100 | 100 |
+| T3 | 3.3 / 5.1 / 5,837 | 97.0 | 94.3 | 100 | 94.3 |
+| T4 | 2.9 / 4.7 / 5.4 | 100 | 98.4 | 100 | 98.2 |
+| T5 | 250 / 703 / 1,008 | 92.7 | 92.7 | 100 | 33.4 |
+
+All tests: 100% final completeness, 0 stale and 0 duplicate finals. T4 recovery P95 = 2.0 ms.
+
+**v5 vs v6**
+
+| Test | Metric | v5 | v6 | Cause |
+|---|---|---|---|---|
+| T2 | P50 / P95 / P99 ms | 9.4 / 13.7 / 14.3 | 3.4 / 5.2 / 6.1 | event-driven wake-up, no 0.1 s poll |
+| T4 | P95 / recovery P95 ms | 12.9 / 4.8 | 4.7 / 2.0 | same |
+| T5 | P50 ms / Fresh-final % | 307 / 87.0 | 250 / 92.7 | ping every 2 msgs doubles lag-mode throughput |
+| T5 | P99 ms | 843 | 1,008 | loss-induced stall detected one message later |
+
 ## Mandatory deterministic application demo
 
 No ASR is needed. Run each command in its own terminal from the project root, with `venv` activated.

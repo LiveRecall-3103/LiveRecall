@@ -3,7 +3,7 @@ title: "CS3103 Assignment 4: LiveRecall"
 author: "Aw Ming Xuan, Kosolpattanadurong Thitiwat, Lee Zhao Rui, Wong Ji Kean "
 documentclass: article
 papersize: a4
-geometry: margin=0.7in
+geometry: margin=0.5in
 fontsize: 10pt
 mainfont: Arial
 sansfont: Arial
@@ -15,6 +15,9 @@ header-includes: |
   \newsavebox{\warnbox}
   \newcommand{\bwarn}{\par\medskip\begin{lrbox}{\warnbox}\begin{minipage}{\dimexpr\linewidth-25pt\relax}\color{black!50!black}}
   \newcommand{\ewarn}{\end{minipage}\end{lrbox}\par\noindent\hbox{{\color{red}\vrule width 5pt}{\setlength{\fboxsep}{10pt}\colorbox{red!6}{\usebox{\warnbox}}}}\par\medskip}
+  \newsavebox{\notebox}
+  \newcommand{\bnote}{\par\medskip\begin{lrbox}{\notebox}\begin{minipage}{\dimexpr\linewidth-25pt\relax}}
+  \newcommand{\enote}{\end{minipage}\end{lrbox}\par\noindent\hbox{{\color{blue!70!black}\vrule width 5pt}{\setlength{\fboxsep}{10pt}\colorbox{blue!6}{\usebox{\notebox}}}}\par\medskip}
   \newcommand{\vtag}[2]{\colorbox{#1}{\textcolor{white}{\textbf{\scriptsize #2}}}}
   \definecolor{vc0}{HTML}{7F7F7F}
   \definecolor{vc1}{HTML}{8C564B}
@@ -34,7 +37,7 @@ header-includes: |
 
 <!-- 
 
- pandoc REPORT.md -o report.pdf
+ pandoc REPORT.md -o report.pdf  --pdf-engine=xelatex
 
 The report must include: architecture and protocol; revision/recovery semantics; backpressure/overload policy;public experiments; at least one before/after optimization comparison; P50/P95/P99/freshness/final-completeness results; discussion of failures and trade-offs; limitations; and a short future-work/FYP direction.
 
@@ -125,15 +128,64 @@ The browser client opens a WebSocket, sends `CLIENT_HELLO`, and renders every `C
 
 # Results
 
-The before/after comparison uses \vfive{} (from `solution_server copy.py`) as the baseline, with per-client queues, ping flow control, lag mode and the buffer-aware lag exit, against the submitted \vsix{} (`solution_server.py`), which replaces lag-mode polling with event-driven wake-up, pings every 2 messages in lag mode, and uses the relaxed lag-exit constants. Each of the 24 public tests was run 3 times per version and we report the median.
+We compare the baseline \vfive{} (`solution_server_v5.py`) against the submitted \vsix{} (`solution_server.py`), which replaces lag-mode polling with event-driven wake-up, pings every 2 messages in lag mode, and relaxes the lag-exit constants. Each public test (T1-T5) was run 3 times per version on Ubuntu 26.04 loopback `lo` with `tc netem` to constraint the networking condition. We use the unmodified `run_demo.py` / `analyse_results.py`; we report medians with freshness threshold of 500 ms.[^raw] Full numeric tables are in `README.md` (Results).
+
+| Test | Clients | Duration | Condition |
+|---|---|---|---|
+| T1 | 20 | 20 s | normal |
+| T2 | 100 | 40 s | normal |
+| T3 | 100 | 60 s | 10% slow readers, 500 ms/msg |
+| T4 | 100 | 60 s | 20% disconnect at 15 s for 5 s |
+| T5 | 100 | 40 s | `delay_loss`: 120 ms ± 30 ms delay, 3% loss |
+
+## Public tests (\vsix{})
+
+All tests reach 100% final completeness with 0 stale and 0 duplicate finals. In `T3`, normal clients stay 100% fresh (P95 4.7 ms) beside slow readers, whose P95 is around 7.8 s and 35% fresh because lag mode skips intermediate provisionals as shown in Figure 2; the T3 P99 and coverage drop come only from slow clients. T4 recovers missed finals by using our `HISTORY` mechanism with recovery P95 2.0 ms. In T5, TCP still delivers everything, but a lost segment waits for retransmission and head-of-line blocking holds back every later message, so loss appears as P95/P99 latency rather than missing captions.
+
+![Fresh %, fresh-final %, completeness and coverage per public test (\vfive{} and \vsix{}). The two versions are nearly identical because \vsix{} only lowers latency, and in T1-T4 latency is already far below the 500 ms freshness threshold. The visible differences are T5 fresh / fresh-final (87.0% → 92.7%, where latency is close to the threshold) and T4 coverage (98.33% → 98.25%). T3 is the same for both because it is driven only by the fixed slow-reader group. \vsix{}'s latency gains are shown in the before/after comparison below.](figures/fresh_coverage_v6.png){width=70%}
+
+![Comparison between normal vs slow clients for T3 (\vsix{}).](figures/t3_isolation.png){width=50%}
+
+\bnote
+
+**T5 coverage (33.4%) is a deliberate trade-off.** Under `delay_loss` every pong takes at least one ~240 ms RTT (above `LAG_PONG_SOFT` = 0.2 s), so all clients enter lag mode and receive finals first plus only the newest provisional. **Normal Update Coverage** requirement is defined for *unconstrained* operation (T1/T2/T4, all 98-100%); on an impaired link we prefer on-time finals over provisionals that are superseded within a second anyway.
+
+\enote
+
+## Before/after comparison: \vfive{} vs \vsix{}
+
+![Caption-age percentiles per public test, \vfive{} vs \vsix{} (log scale).](figures/latency_v5_v6.png){width=70%}
+
+Figure 3 plots the median caption-age P50/P95/P99 of each version over 3 runs per test (the same runs summarised in `README.md`). Event-driven wake-up (no 0.1 s poll) produces the clearest gap in the figure: T2 P50/P95/P99 fall from 9.4/13.7/14.3 ms to 3.4/5.2/6.1 ms, and T4 P95 from 12.9 to 4.7 ms (recovery P95 4.8 → 2.0 ms, from the `analyse_results.py` recovery output). In T5, pinging every 2 messages roughly doubles lag-mode throughput: Figure 3 shows P50 dropping from 307 to 250 ms, which is what lifts fresh-final from 87.0% to 92.7% in Figure 1. The one bar that rises in Figure 3 is T5 P99 (843 → 1,008 ms), because a loss-induced stall is detected one message later.
+
+T1 bars are nearly identical in Figure 3 (the load is too light to queue), and T3 is dominated by the slow-reader tail seen in Figure 2, which is unchanged because the bottleneck is the client's read rate, not the server.
 
 # Discussion
 
+- **Freshness vs coverage under impairment:** we trade provisional coverage for on-time finals (T5 note above).
+- **Slow clients:** a 500 ms/msg reader cannot physically receive more, so we skip provisionals rather than disconnect; the 10 s lag-window disconnect bounds staleness.
+- **Lag-mode exit is conservative:** the buffer estimate (32 + 2 messages) keeps clients in lag mode for most of a run once entered, which is why T5 coverage stays low for the whole test. A shorter `LAG_QUEUE_GUESS`, or a client-echoed sequence number, would let clients leave earlier.
+- **Ping/pong overhead:** one extra frame per message in normal mode; acceptable on LAN, halved in lag mode by \vsix{}.
+- **Failures during development:** \vone{} drained queues into socket buffers, hiding backlog; \vfour{} oscillated in and out of lag mode; \vfive{} lagged on high-RTT links at one message per RTT, fixed in \vsix{}.
+
+## Limitations
+
+- Lag-mode exit too conservative.
+- Backlog is estimated from pong timing, not measured. It is possible to mis-estimate for clients with variable read speed.
+- Tested only on loopback with `tc netem`; no real WAN / multi-host test.
+- Single-process asyncio server; no horizontal scaling.
+
 # Conclusion
 
-\appendix
+We have achieved a 100% completion rate across all public tests, achieving zero stale or duplicate packets, isolating slow clients, and maintaining bounded memory. This assignment offers a brief overview of network programming, teaching us how to build the intuition required to design protocols that handle congestion, handle unexpected network disruptions, and scale efficiently as client volume increases.
 
-# Raw data
+For future work or FYP, we can experiment on the idea of client-acknowledged sequence numbers for exact backlog, adaptive thresholds from measured RTT baseline (so a uniformly delayed link is not treated as lagged), or using congestion control that closely resembles modern TCP flow and congestion control protocols.
+
+[^raw]: Raw per-run results are in `tests/test_results/public/v5/` and `tests/test_results/public/v6/` (`tN_run0X.json`, 3 runs per test). Reproduce with `./run_public_tests.sh` (set `SERVER`, `OUT`, `LIVERECALL_VERSION`); figures are generated by `docs/figures/plot_results.ipynb`.
+
+\newpage
+
+\appendix
 
 # ASR Bonus: Real-Lecture Caption Source
 
