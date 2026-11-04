@@ -68,7 +68,18 @@ async def main():
         ffmpeg_command = ffmpeg_command + ["-vn", "-af", "asetpts=N/SR/TB", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "-"]
         ffmpeg = subprocess.Popen(ffmpeg_command, stdout=subprocess.PIPE, start_new_session=True)
         threading.Thread(target=read_audio, args=(ffmpeg,), daemon=True).start()
-        asyncio.get_running_loop().add_signal_handler(signal.SIGINT, ffmpeg.terminate)
+        loop = asyncio.get_running_loop()
+        stopping = False
+
+        # First Ctrl+C: stop now without transcribing the queued audio. Second Ctrl+C: force quit.
+        def stop():
+            nonlocal stopping
+            stopping = True
+            ffmpeg.terminate()
+            audio_queue.put(None)  # wake the loop if it is waiting for audio
+            loop.remove_signal_handler(signal.SIGINT)
+
+        loop.add_signal_handler(signal.SIGINT, stop)
 
         segment_number = 1      # Which segment number is this
         revision = 0            # Last revision sent for this segment, 0 if none sent yet
@@ -80,7 +91,7 @@ async def main():
 
                 # Dequeue item and timestamp from queue
                 item = await asyncio.to_thread(audio_queue.get)
-                if item is None:
+                if item is None or stopping:
                     break
                 chunk_time, raw_audio = item
 
