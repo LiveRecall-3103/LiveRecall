@@ -7,6 +7,5 @@ results/
 *.log
 *.pdf
 *.csv
-*.json
 analytics/figures/
 myenv/
