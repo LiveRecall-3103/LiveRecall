@@ -6,7 +6,7 @@
 |---|---|---|
 | Aw Ming Xuan `@icyyolo` | A0308470H | Live-caption client UI (recall filters 15/30/60s, revision replacement, 90s pruning); client auto-reconnect with resume state & HISTORY merge; lag detection/exit tuning (idle-RTT baseline, soft-pong entry, shared-bottleneck exit, slow-reader pinning); bonus ASR source with draft/final revisions; public test runs & results |
 | Kosolpattanadurong Thitiwat `@CATISNOTSODIUM` | A0305613N | Report lead (architecture & protocol, client handling, recovery semantics, results/discussion & figures, overall editing and PDF generation); browser client frontend (caption rendering, HTML/CSS layout and styling) |
-| Lee Zhao Rui `@oilyfishball` | A0308380H | Starter-kit setup & docs organisation; per-connection send queues with unicast error handling, overflow drop & stale-packet removal; ping-based flow control, version control, disconnected-client handling; smart pacing & pipelining; results and AI usage declaration |
+| Lee Zhao Rui `@oilyfishball` | A0308380H | Starter-kit setup & docs organisation; per-connection send queues with unicast error handling, overflow drop & stale-packet removal; ping-based flow control, version control; smart pacing & pipelining; results |
 | Wong Ji Kean `@ji-just-ji` | A0252449Y | Caption store (store.py) and Source→Server update parsing with tests; batch-sending optimisation; data-structure optimisation moving work into store; send-timing/lag constant tuning; stress-testing harness | 
 
 
