@@ -118,8 +118,12 @@ class FrontEndRenderer {
             row.classList.remove("is-final");
         }
 
-        this.lastSegmentId = segment_id;
-        this.lastRevisionId = revision_id;
+        // Resume cursor tracks the latest finalized state only; advancing it on a
+        // provisional update makes the server skip that segment's final on reconnect.
+        if (msg.final) {
+            this.lastSegmentId = segment_id;
+            this.lastRevisionId = revision_id;
+        }
         this.refresh(has_new_segment);
     }
 }
@@ -190,7 +194,7 @@ function connect() {
       type: "CLIENT_HELLO",
       client_id: numericClientId(),
       session: "L1",
-      last_segment: getLastSegmentId(),       // TODO: resume latest finalized state
+      last_segment: getLastSegmentId(),
       last_revision: getLastRevisionId(),
       history_seconds: 60
     }));
