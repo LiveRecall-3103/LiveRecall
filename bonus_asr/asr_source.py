@@ -20,8 +20,10 @@ SEGMENT_TIMING_SEC = 5      # Each segment is 5 seconds
 FIRST_REVISION_SEC = 2      # Wait for 2s for audio to stabalize before parsing it to ASR model
 MAX_QUEUE_CHUNKS = 30        # at most 30 * 1 = 30 s of waiting audio
 
-# Microphone. To use a video file instead: ["-re", "-i", "lecture.mp4"]
-AUDIO_INPUT = ["-f", "pulse", "-i", "RDPSource"]   # Microphone input
+# Audio input. Uncomment one:
+# AUDIO_INPUT = ["-f", "pulse", "-i", "RDPSource"]     # default: mic under WSL (WSLg)
+AUDIO_INPUT = ["-f", "pulse", "-i", "default"]     # mic on native Linux
+# AUDIO_INPUT = ["-re", "-i", "lecture.wav"]         # audio or video file, played in real time
 
 # Initialize audio queue to keep audio chunks from ffmpeg
 audio_queue = queue.Queue()
