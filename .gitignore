@@ -7,6 +7,7 @@ results/
 *.log
 *.pdf
 !docs/report.pdf
+!report.pdf
 *.csv
 *.json
 analytics/figures/
