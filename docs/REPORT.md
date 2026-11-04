@@ -44,7 +44,7 @@ The report must include: architecture and protocol; revision/recovery semantics;
 
 Our system has two parts: the solution server (`solution_server.py`) and the browser client (`client/app.js`). The server has two main components: a `CaptionStore`, which holds the captions received from the caption source, and a set of `Client` objects, each holding one client's WebSocket connection and its send queue.
 
-When a WebSocket connects, the server reads the `type` of its first message to tell the caption source (`SOURCE_HELLO`) from a viewer (`CLIENT_HELLO`) and dispatches it to the matching handler (`handle_source` or `handle_client_new`). The following sections describe how each handler works internally.
+When a WebSocket connects, the server reads the `type` of its first message to tell the caption source (`SOURCE_HELLO`) from a viewer (`CLIENT_HELLO`) and dispatches it to the matching handler (`handle_source` or `handle_client`). The following sections describe how each handler works internally.
 
 ## Server: storing captions
 The `CaptionStore` (`server/store.py`) holds the server's view of the last `keep_seconds` of the transcript. It keeps a deque `order` of segment numbers, in order, and a hashmap from segment number to an `Entry` holding the segment's `source_ts` (source timestamp), revision, finality and text.
@@ -70,7 +70,7 @@ On reconnect (or late join, with `last_segment = 0`), the client sends `CLIENT_H
 
 ## Server: Sending to clients
 
-When a client connects (`CLIENT_HELLO`), the server queues its initial history from the store (see [Recovery semantics](#recovery-semantics)) and spawns a background sender task, `unicast(client)`. This task takes segment ids from the client's queue, reads their latest text from the store and sends them according to our protocol, which went through several versions during optimization. The table below summarizes how the sending path evolved from \vzero{} to \vsix{}; each version retains all previous functionality (controlled by `LIVERECALL_VERSION` in `config.py`).
+When a client connects (`CLIENT_HELLO`), the server queues its initial history from the store (see [Recovery semantics](#recovery-semantics)) and spawns a background sender task, `unicast(client)`. This task takes segment ids from the client's queue, reads their latest text from the store and sends them according to our protocol, which went through several versions during optimization. The table below summarizes how the sending path evolved from \vzero{} to \vsix{}; each version retains all previous functionality. The submitted `solution_server.py` is \vsix{}.
 
 [^2]: Dirty set is a dictionary that maps segment id to the time it first became dirty. A segment is dirty for a client when its content has changed in the server's store but that client hasn't been sent the new version yet. Each client has its own dirty set.
 
@@ -79,14 +79,14 @@ When a client connects (`CLIENT_HELLO`), the server queues its initial history f
 ```
 
 | Mechanism | What it does | Problem addressed |
-|---|-------|----|
+|---|------|------|
 | \vzero{} Naive broadcast | Sends each update to every client; the source awaits all sends. | One slow client stalls the source and all others. |
 | \vone{} Per-client dirty set[^2] | Each client has a FIFO queue of segment ids. `broadcast()` appends the segment id to the back of each client's queue (if already queued, it keeps its place, so repeated edits coalesce into one entry) and wakes that client's sender. The sender pops from the front and reads the segment's latest text from the store at send time. Close the client if its queue reaches 100 segments. | Backlog bounded by segments, not edits; slow readers block no one. *Issue:* `send()` returns once data is in the OS socket buffer, so the queue drains instantly and stays near zero; the real backlog hides in socket/client buffers, invisible to the server. |
 | \vtwo{} Ping flow control | Ping after each send; wait for pong up to `PONG_WAIT` = 1 s. This ensures that the client has read every earlier message off the socket. | It solves the queue draining problem. We also use pong RTT for further optimizations (e.g., detecting client read rates). |
 | \vthree{} Lag-window disconnect | Forcing client to disconnect when the oldest dirty entry is greater than  `MAX_LAG_WINDOW` = 10 s.| Bounds staleness; client recovers via `HISTORY`. |
 | \vfour{} Lag mode (for slow clients) | Enter this mode if dirty age > 0.5 s or a pong > 0.3 s. Under lag mode, we send the missing finals oldest first. We only send the newest provisional messages after `LAG_PROV_GAP` = 4 s idle. Exiting lag mode requires 3 fast pongs and a 3-second minimum duration. | For slow clients, finals never delayed; unreadable intermediate revisions skipped. *Issue:* fast pongs only show the client is reading quickly *now*, not that it has caught up; it can leave lag mode with stale messages still in its receive buffer, fall behind again and oscillate between modes. |
 | \vfive{} **Buffer-aware lag exit** | Fast pongs are no longer enough to exit: the server also estimates whether the client's receive buffer has drained (estimated reads > messages sent in lag + 36; see [Receive buffer estimation](#receive-buffer-estimation)). Soft-pong threshold lowered to 0.2 s. | Fixes the \vfour{} issue: no premature return to full updates, so no oscillation; also earlier lag detection. *Issue:* the lag-mode sender polls every 0.1 s and waits for a pong after every message, so a new final can sit for up to one poll interval plus a full RTT, and on a high-latency link throughput is capped at one message per RTT. |
-| \vsix{} Event-driven pacing | Lag-mode sender sleeps on an event (woken by `broadcast()`) instead of polling every 0.1 s; a final that arrives while a pong is outstanding is sent at once; in lag mode it pings once every 4 messages (`PING_EVERY_N`) rather than after each one. | Fixes the \vfive{} issue: new finals go out immediately instead of waiting for the next poll or pong. |
+| \vsix{} Event-driven pacing | Lag-mode sender sleeps on an event (woken by `broadcast()`) instead of polling every 0.1 s; a final that arrives while a pong is outstanding is sent at once; in lag mode it pings once every 2 messages (`PING_EVERY_N` = 2) rather than after each one. | Fixes the \vfive{} issue: new finals go out as soon as they arrive instead of waiting for the next poll, and halving the pings roughly doubles lag-mode throughput on a high-latency link. |
 
 ```{=latex}
 \endgroup
@@ -97,19 +97,19 @@ When a client connects (`CLIENT_HELLO`), the server queues its initial history f
 The server cannot see a client's receive buffer, i.e. the messages the client's WebSocket library has received but the client has not yet processed. A fast pong shows the client is reading quickly *now*, not that the buffer is empty, so from \vfive{} onwards the server estimates the backlog conservatively before letting a client leave lag mode:
 
 1. **Assume the buffer was full when lag began.** `LAG_QUEUE_GUESS` = 32 messages, a deliberately high guess.
-2. **Estimate the per-message read time** `iv_est` from pong RTTs during lag. While the buffer is full, each pong returns about one read interval after the previous one. We keep the largest value seen (capped at `IV_CAP` = 2 s), since overestimating is the safe direction.
+2. **Estimate the per-message read time** `iv_est` from pong RTTs during lag. While the buffer is full, each pong returns about one read interval after the previous one. We keep the largest value seen (capped at `IV_CAP` = 1 s), since overestimating is the safe direction. The initial estimate is the RTT of the pong that triggered lag mode (at least 0.1 s).
 3. **Count reads.** Estimated reads = time in lag / `iv_est`. The client must work through the 32 assumed messages plus every message sent during lag (`lag_sent`).
-4. **Exit only once it has caught up:** `reads - lag_sent >= LAG_QUEUE_GUESS + LAG_EXIT_MARGIN` (32 + 4), together with 3 fast pongs.
+4. **Exit only once it has caught up:** `reads - lag_sent >= LAG_QUEUE_GUESS + LAG_EXIT_MARGIN` (32 + 2), and the latest pong was fast (`LAG_CALM_PONGS` = 1, RTT $\le$ 0.2 s). On exit, every in-progress (non-final) segment is marked dirty again so the client immediately receives their latest text.
 
-For example, a client reading one message every 0.5 s that has been sent 10 messages in lag needs about 46 reads (~23 s) before it may exit. Overestimating the buffer only delays the exit slightly, while underestimating would send the client back into lag almost immediately. This check applies when the slowness is the client's own; when many clients lag at once (a shared cause), the client instead has to stay fast for a minimum calm period.
+For example, a client reading one message every 0.5 s that has been sent 10 messages in lag needs about 44 reads (~22 s) before it may exit. Overestimating the buffer only delays the exit slightly, while underestimating would send the client back into lag almost immediately. (\vfive{} originally used a margin of 4, `IV_CAP` = 2 s and 3 fast pongs; we relaxed these so clients leave lag mode sooner once they recover.)
 
 Putting the pieces together, each client's sender is a small two-state machine, in normal mode (every update, one pong per message) or lag mode (finals first, rationed provisionals). The transitions between the two states are the core of our backpressure policy and are summarised below.
 
 \bwarn
 
-**Normal  &rarr; Lag.** The server switches a client to lag mode as soon as it looks like the client cannot keep up: updates are piling up unsent, or its pongs come back slowly (measured relative to its normal RTT). From then on it sends only what matters: missing finals, plus an occasional latest provisional.
+**Normal  &rarr; Lag.** The server switches a client to lag mode as soon as it looks like the client cannot keep up: its oldest unsent update is older than 0.5 s (`LAG_AGE_ENTER`), or a single pong takes longer than 0.2 s (`LAG_PONG_SOFT`) or times out after 1 s. Its dirty set is cleared (the store and the client's final cursor now determine what to send), and from then on it sends only what matters: missing finals oldest first, never paced, plus the latest provisional after 4 s without a send.
 
-**Lag &rarr; Normal.** The client returns to normal mode once its pongs are fast again *and* it has caught up. If the slowness was the client's own, "caught up" means its backlog has drained; if many clients lagged at once (a shared cause), it must stay fast for a while, and that wait grows each time it relapses.
+**Lag &rarr; Normal.** The client returns to normal mode once its latest pong is fast again *and* the receive-buffer estimate says its backlog has drained. Its in-progress segments are then re-queued so it receives full updates again.
 
 \ewarn
 
@@ -125,7 +125,7 @@ The browser client opens a WebSocket, sends `CLIENT_HELLO`, and renders every `C
 
 # Results
 
-The before/after comparison uses three server versions, v5, v6 and v7 (see `test_results.md`): v5 is the baseline with per-client queues, ping flow control and lag mode; v6 replaces lag-mode polling with event-driven wake-up; v7 judges lag by RTT above the idle minimum and requires two soft-slow pongs. Each of the 24 public tests was run 3 times per version and we report the median.
+The before/after comparison uses \vfive{} (from `solution_server copy.py`) as the baseline, with per-client queues, ping flow control, lag mode and the buffer-aware lag exit, against the submitted \vsix{} (`solution_server.py`), which replaces lag-mode polling with event-driven wake-up, pings every 2 messages in lag mode, and uses the relaxed lag-exit constants. Each of the 24 public tests was run 3 times per version and we report the median.
 
 # Discussion
 
