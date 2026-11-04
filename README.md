@@ -5,7 +5,7 @@
 | Name | Student ID | Main responsibility |
 |---|---|---|
 | Aw Ming Xuan `@icyyolo` | A0308470H | Live-caption client UI (recall filters 15/30/60s, revision replacement, 90s pruning); client auto-reconnect with resume state & HISTORY merge; lag detection/exit tuning (idle-RTT baseline, soft-pong entry, shared-bottleneck exit, slow-reader pinning); bonus ASR source with draft/final revisions; public test runs & results |
-| Kosolpattanadurong Thitiwat `@CATISNOTSODIUM` | A0305613N | Architecture & protocol design docs; history-window and disconnect-window optimisations; client handling; utilities, Makefile, private test scripts & analytics; report writing and PDF generation |
+| Kosolpattanadurong Thitiwat `@CATISNOTSODIUM` | A0305613N | Client browser (frontend)  Reports: architecture and Protocol, Recovery semantics, Results/Discussion write-up and figures, overall editing and PDF generation |
 | Lee Zhao Rui `@oilyfishball` | A0308380H | Starter-kit setup & docs organisation; per-connection send queues with unicast error handling, overflow drop & stale-packet removal; ping-based flow control, version control, disconnected-client handling; smart pacing & pipelining; results and AI usage declaration |
 | Wong Ji Kean `@ji-just-ji` | A0252449Y | Caption store (store.py) and Source→Server update parsing with tests; batch-sending optimisation; data-structure optimisation moving work into store; send-timing/lag constant tuning; stress-testing harness | 
 
@@ -147,7 +147,7 @@ Median of 3 runs per test, freshness threshold T = 500 ms, Ubuntu loopback. v6 =
 | T2 | 3.4 / 5.2 / 6.1 | 100 | 100 | 100 | 100 |
 | T3 | 3.3 / 5.1 / 5,837 | 97.0 | 94.3 | 100 | 94.3 |
 | T4 | 2.9 / 4.7 / 5.4 | 100 | 98.4 | 100 | 98.2 |
-| T5 | 250 / 703 / 1,008 | 92.7 | 92.7 | 100 | 33.4 |
+| T5 | 251 / 690 / 1,091 | 91.8 | 91.8 | 100 | 33.4 |
 
 All tests: 100% final completeness, 0 stale and 0 duplicate finals. T4 recovery P95 = 2.0 ms.
 
@@ -157,8 +157,8 @@ All tests: 100% final completeness, 0 stale and 0 duplicate finals. T4 recovery 
 |---|---|---|---|---|
 | T2 | P50 / P95 / P99 ms | 9.4 / 13.7 / 14.3 | 3.4 / 5.2 / 6.1 | event-driven wake-up, no 0.1 s poll |
 | T4 | P95 / recovery P95 ms | 12.9 / 4.8 | 4.7 / 2.0 | same |
-| T5 | P50 ms / Fresh-final % | 307 / 87.0 | 250 / 92.7 | ping every 2 msgs doubles lag-mode throughput |
-| T5 | P99 ms | 843 | 1,008 | loss-induced stall detected one message later |
+| T5 | P50 ms / Fresh-final % | 307 / 87.0 | 251 / 91.8 | ping every 2 msgs doubles lag-mode throughput |
+| T5 | P95 / P99 ms | 682 / 843 | 690 / 1,091 | loss-induced stall detected one message later |
 
 ## Mandatory deterministic application demo
 

@@ -4,6 +4,9 @@
 
 List the generative-AI/coding tools used by the team and what each was used for.
 
+- **Report formatting:** We used AI to help format the report (Markdown structure, tables, figure captions and layout). The team wrote and checked all the technical content.
+- **Graph data analysis:** We used AI to help analyse the experiment data behind our graphs, such as summarising trends and comparing results across versions. We checked every number and conclusion against the raw test outputs before putting it in the report.
+
 ## One useful suggestion
 
 Describe one suggestion that materially helped the project and how you verified it.
