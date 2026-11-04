@@ -60,6 +60,7 @@ class FrontEndRenderer {
     }
 
     refresh(sorted) {
+        const nearBottom = this.element.scrollHeight - this.element.scrollTop - this.element.clientHeight < 100;
         if (sorted) {
             const elements = Array.from(this.element.children);
             elements.sort((a, b) => {
@@ -67,7 +68,7 @@ class FrontEndRenderer {
             });
             elements.forEach(el => this.element.appendChild(el));
         }
-        this.element.scrollTop = this.element.scrollHeight;
+        if (nearBottom) this.element.scrollTop = this.element.scrollHeight;
     }
 
     remove(segment_id) {
